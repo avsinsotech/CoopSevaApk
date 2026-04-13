@@ -3,6 +3,7 @@ import 'dart:ui';
 import 'dart:async';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
+import 'package:form_app_27_3_2026/customer_profile_service.dart';
 import 'package:flutter/material.dart';
 import 'package:form_app_27_3_2026/color_constants.dart';
 import 'package:image_picker/image_picker.dart';
@@ -127,7 +128,12 @@ class NomineeEntry {
 
 class NewCustomerScreen extends StatefulWidget {
   final String? initialMobileNumber;
-  const NewCustomerScreen({super.key, this.initialMobileNumber});
+  final Map<String, dynamic>? existingCustomerData;
+  const NewCustomerScreen({
+    super.key,
+    this.initialMobileNumber,
+    this.existingCustomerData,
+  });
 
   @override
   State<NewCustomerScreen> createState() => _NewCustomerScreenState();
@@ -156,6 +162,9 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
   bool _isSubmitting = false;
 
   final CustomerSubmitService _submitService = CustomerSubmitService();
+  final CustomerProfileService _updateService = CustomerProfileService();
+
+  bool get _isUpdateMode => widget.existingCustomerData != null;
 
   // Form Navigation State
 
@@ -320,17 +329,17 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                 },
               ),
 
-              ListTile(
-                leading: const Icon(Icons.photo_library),
+              // ListTile(
+              //   leading: const Icon(Icons.photo_library),
 
-                title: const Text('Choose from Gallery'),
+              //   title: const Text('Choose from Gallery'),
 
-                onTap: () {
-                  Navigator.pop(context);
+              //   onTap: () {
+              //     Navigator.pop(context);
 
-                  _pickSignature(ImageSource.gallery);
-                },
-              ),
+              //     _pickSignature(ImageSource.gallery);
+              //   },
+              // ),
             ],
           ),
         );
@@ -794,34 +803,36 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
     setState(() => _isAadhaarLoading = true);
 
     try {
-      // 1. Check if user already exists
-      final checkResponse = await http.get(
-        Uri.parse(
-          'https://coop360.avsinsotech.com/api/CustomerProfile/check-aadhar/${_aadhaarController.text}',
-        ),
-      );
+      // 1. Check if user already exists (skip in update mode — customer already exists)
+      if (!_isUpdateMode) {
+        final checkResponse = await http.get(
+          Uri.parse(
+            'https://coop360.avsinsotech.com/api/CustomerProfile/check-aadhar/${_aadhaarController.text}',
+          ),
+        );
 
-      if (checkResponse.statusCode == 200) {
-        final checkData = json.decode(checkResponse.body);
-        if (checkData['exists'] == true) {
-          if (mounted) {
-            showDialog(
-              context: context,
-              builder: (ctx) => AlertDialog(
-                title: const Text('Customer Exists'),
-                content: const Text(
-                  'User with that aadhar number already exists',
-                ),
-                actions: [
-                  TextButton(
-                    onPressed: () => Navigator.pop(ctx),
-                    child: const Text('OK'),
+        if (checkResponse.statusCode == 200) {
+          final checkData = json.decode(checkResponse.body);
+          if (checkData['exists'] == true) {
+            if (mounted) {
+              showDialog(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: const Text('Customer Exists'),
+                  content: const Text(
+                    'User with that aadhar number already exists',
                   ),
-                ],
-              ),
-            );
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(ctx),
+                      child: const Text('OK'),
+                    ),
+                  ],
+                ),
+              );
+            }
+            return; // Stop flow
           }
-          return; // Stop flow
         }
       }
 
@@ -1706,46 +1717,46 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                             },
                           ),
 
-                          ListTile(
-                            leading: const Icon(
-                              Icons.photo_library,
-                              color: Color(0xFF0F1E4A),
-                            ),
-                            title: const Text('Upload from Device'),
-                            onTap: () async {
-                              Navigator.pop(ctx);
+                          // ListTile(
+                          //   leading: const Icon(
+                          //     Icons.photo_library,
+                          //     color: Color(0xFF0F1E4A),
+                          //   ),
+                          //   title: const Text('Upload from Device'),
+                          //   onTap: () async {
+                          //     Navigator.pop(ctx);
 
-                              final picked = await _picker.pickImage(
-                                source: ImageSource.gallery,
-                              );
+                          //     final picked = await _picker.pickImage(
+                          //       source: ImageSource.gallery,
+                          //     );
 
-                              if (picked != null) {
-                                // ✅ Crop image
-                                final croppedFile = await ImageCropper()
-                                    .cropImage(
-                                      sourcePath: picked.path,
-                                      compressQuality: 80,
-                                      uiSettings: [
-                                        AndroidUiSettings(
-                                          toolbarTitle: 'Crop Image',
-                                          toolbarColor: Color(0xFF0F1E4A),
-                                          toolbarWidgetColor: Colors.white,
-                                        ),
-                                        IOSUiSettings(title: 'Crop Image'),
-                                      ],
-                                    );
+                          //     if (picked != null) {
+                          //       // ✅ Crop image
+                          //       final croppedFile = await ImageCropper()
+                          //           .cropImage(
+                          //             sourcePath: picked.path,
+                          //             compressQuality: 80,
+                          //             uiSettings: [
+                          //               AndroidUiSettings(
+                          //                 toolbarTitle: 'Crop Image',
+                          //                 toolbarColor: Color(0xFF0F1E4A),
+                          //                 toolbarWidgetColor: Colors.white,
+                          //               ),
+                          //               IOSUiSettings(title: 'Crop Image'),
+                          //             ],
+                          //           );
 
-                                if (croppedFile == null) return;
+                          //       if (croppedFile == null) return;
 
-                                final croppedPicked = XFile(croppedFile.path);
+                          //       final croppedPicked = XFile(croppedFile.path);
 
-                                setState(() {
-                                  _photoFile = croppedPicked;
-                                  _profileImageBytes = null;
-                                });
-                              }
-                            },
-                          ),
+                          //       setState(() {
+                          //         _photoFile = croppedPicked;
+                          //         _profileImageBytes = null;
+                          //       });
+                          //     }
+                          //   },
+                          // ),
                           const SizedBox(height: 8),
                         ],
                       ),
@@ -6677,53 +6688,113 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                           "submittedByUserId": userId,
                         };
 
-                        debugPrint('--- SUBMIT PAYLOAD ---');
+                        debugPrint(
+                          '--- ${_isUpdateMode ? "UPDATE" : "SUBMIT"} PAYLOAD ---',
+                        );
                         debugPrint(json.encode(data));
 
-                        // ✅ Send flat — NO {"request": data} wrapper
-                        final response = await _submitService.submitProfile(
-                          data,
-                        );
+                        if (_isUpdateMode) {
+                          // ✅ UPDATE MODE — use update API for existing CIF ID customer
+                          final referenceId =
+                              (widget.existingCustomerData!['referenceID'] ??
+                                      widget
+                                          .existingCustomerData!['customerId'] ??
+                                      '')
+                                  .toString();
+                          final response = await _updateService.updateProfile(
+                            referenceId,
+                            data,
+                          );
 
-                        setState(() => _isSubmitting = false);
+                          setState(() => _isSubmitting = false);
 
-                        if (response != null) {
-                          final String msg =
-                              response['message'] ??
-                              'Customer Form Submitted Successfully!';
-                          final dynamic customerId =
-                              response['referenceID'] ?? response['customerId'];
+                          if (response['success'] == true) {
+                            final String msg =
+                                response['data']?['message'] ??
+                                'Customer Profile Updated Successfully!';
+                            final dynamic customerId =
+                                response['data']?['referenceID'] ??
+                                response['data']?['customerId'];
 
-                          if (context.mounted) {
-                            showDialog(
-                              context: context,
-                              builder: (context) => AlertDialog(
-                                title: const Text('Success'),
-                                content: Text(
-                                  '$msg\nCustomer Reference Number: ${customerId ?? "N/A"}',
-                                ),
-                                actions: [
-                                  TextButton(
-                                    onPressed: () {
-                                      Navigator.pop(context);
-                                      Navigator.pop(context);
-                                    },
-                                    child: const Text('OK'),
+                            if (context.mounted) {
+                              showDialog(
+                                context: context,
+                                builder: (context) => AlertDialog(
+                                  title: const Text('Success'),
+                                  content: Text(
+                                    '$msg\nCustomer Reference Number: ${customerId ?? "N/A"}',
                                   ),
-                                ],
-                              ),
-                            );
+                                  actions: [
+                                    TextButton(
+                                      onPressed: () {
+                                        Navigator.pop(context);
+                                        Navigator.pop(context);
+                                      },
+                                      child: const Text('OK'),
+                                    ),
+                                  ],
+                                ),
+                              );
+                            }
+                          } else {
+                            if (context.mounted) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                SnackBar(
+                                  content: Text(
+                                    'Failed to update profile: ${response['error'] ?? 'Unknown error'}',
+                                  ),
+                                  backgroundColor: Colors.red,
+                                ),
+                              );
+                            }
                           }
                         } else {
-                          if (context.mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(
-                                content: Text(
-                                  'Failed to submit registration. Check log for details.',
+                          // ✅ CREATE MODE — use submit API for new customer
+                          final response = await _submitService.submitProfile(
+                            data,
+                          );
+
+                          setState(() => _isSubmitting = false);
+
+                          if (response != null) {
+                            final String msg =
+                                response['message'] ??
+                                'Customer Form Submitted Successfully!';
+                            final dynamic customerId =
+                                response['referenceID'] ??
+                                response['customerId'];
+
+                            if (context.mounted) {
+                              showDialog(
+                                context: context,
+                                builder: (context) => AlertDialog(
+                                  title: const Text('Success'),
+                                  content: Text(
+                                    '$msg\nCustomer Reference Number: ${customerId ?? "N/A"}',
+                                  ),
+                                  actions: [
+                                    TextButton(
+                                      onPressed: () {
+                                        Navigator.pop(context);
+                                        Navigator.pop(context);
+                                      },
+                                      child: const Text('OK'),
+                                    ),
+                                  ],
                                 ),
-                                backgroundColor: Colors.red,
-                              ),
-                            );
+                              );
+                            }
+                          } else {
+                            if (context.mounted) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                  content: Text(
+                                    'Failed to submit registration. Check log for details.',
+                                  ),
+                                  backgroundColor: Colors.red,
+                                ),
+                              );
+                            }
                           }
                         }
                       } catch (e, stack) {

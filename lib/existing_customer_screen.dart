@@ -90,7 +90,12 @@ class _ExistingCustomerScreenState extends State<ExistingCustomerScreen> {
         });
         Navigator.push(
           context,
-          MaterialPageRoute(builder: (_) => NewCustomerScreen(initialMobileNumber: data['mobileNumber']?.toString())),
+          MaterialPageRoute(
+            builder: (_) => NewCustomerScreen(
+              initialMobileNumber: data['mobileNumber']?.toString(),
+              existingCustomerData: data,
+            ),
+          ),
         );
         return;
       }
