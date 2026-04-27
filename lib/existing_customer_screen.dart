@@ -529,24 +529,55 @@ class _ExistingCustomerScreenState extends State<ExistingCustomerScreen> {
           const SizedBox(height: 12),
           if (_ovdImg1 != null)
             _buildImageCard(
-              'OVD Document 1 — ${_customerData!['ovdType_1'] ?? ''}',
+              _customerData!['ovdType_1'] == 'Aadhaar Card'
+                  ? 'OVD Document 1 — Aadhaar Card (Front)'
+                  : 'OVD Document 1 — ${_customerData!['ovdType_1'] ?? ''}',
               _ovdImg1!,
             ),
           const SizedBox(height: 12),
+          if (_ovdImg4 != null && _customerData!['ovdType_1'] == 'Aadhaar Card') ...[
+            _buildImageCard('Aadhaar Card (Back)', _ovdImg4!),
+            const SizedBox(height: 12),
+          ],
+
           if (_ovdImg2 != null)
             _buildImageCard(
-              'OVD Document 2 — ${_customerData!['ovdType_2'] ?? ''}',
+              _customerData!['ovdType_2'] == 'Aadhaar Card'
+                  ? 'OVD Document 2 — Aadhaar Card (Front)'
+                  : 'OVD Document 2 — ${_customerData!['ovdType_2'] ?? ''}',
               _ovdImg2!,
             ),
           const SizedBox(height: 12),
+          if (_ovdImg4 != null && 
+              _customerData!['ovdType_2'] == 'Aadhaar Card' &&
+              _customerData!['ovdType_1'] != 'Aadhaar Card') ...[
+            _buildImageCard('Aadhaar Card (Back)', _ovdImg4!),
+            const SizedBox(height: 12),
+          ],
+
           if (_ovdImg3 != null)
             _buildImageCard(
-              'OVD Document 3 — ${_customerData!['ovdType_3'] ?? ''}',
+              _customerData!['ovdType_3'] == 'Aadhaar Card'
+                  ? 'OVD Document 3 — Aadhaar Card (Front)'
+                  : 'OVD Document 3 — ${_customerData!['ovdType_3'] ?? ''}',
               _ovdImg3!,
             ),
           const SizedBox(height: 12),
-          if (_ovdImg4 != null) _buildImageCard('OVD Document 4', _ovdImg4!),
-          const SizedBox(height: 12),
+          if (_ovdImg4 != null && 
+              _customerData!['ovdType_3'] == 'Aadhaar Card' &&
+              _customerData!['ovdType_1'] != 'Aadhaar Card' &&
+              _customerData!['ovdType_2'] != 'Aadhaar Card') ...[
+            _buildImageCard('Aadhaar Card (Back)', _ovdImg4!),
+            const SizedBox(height: 12),
+          ],
+
+          if (_ovdImg4 != null && 
+              _customerData!['ovdType_1'] != 'Aadhaar Card' &&
+              _customerData!['ovdType_2'] != 'Aadhaar Card' &&
+              _customerData!['ovdType_3'] != 'Aadhaar Card') ...[
+            _buildImageCard('OVD Document 4', _ovdImg4!),
+            const SizedBox(height: 12),
+          ],
           if (_form60Img != null)
             _buildImageCard('Form 60/61 Reference', _form60Img!),
           const SizedBox(height: 12),

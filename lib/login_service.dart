@@ -2,7 +2,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 class LoginService {
-  final String _authBaseUrl = 'https://coop360.avsinsotech.com/api/Auth';
+  final String _authBaseUrl = 'https://swiftkyc.avsinsotech.com/api/Auth';
 
   Future<LoginResult> login(String username, String password) async {
     final url = Uri.parse('$_authBaseUrl/app-login');

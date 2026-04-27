@@ -9,10 +9,16 @@ final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  
+
   // Clear any existing session to ensure logout on app restart/close
+  // Preserve _formRecovery_* keys so process-death recovery still works
   final prefs = await SharedPreferences.getInstance();
-  await prefs.clear(); 
+  final allKeys = prefs.getKeys().toList();
+  for (final key in allKeys) {
+    if (!key.startsWith('_formRecovery_')) {
+      await prefs.remove(key);
+    }
+  }
 
   runApp(const AvsServiceApp());
 }
@@ -36,7 +42,13 @@ class _AvsServiceAppState extends State<AvsServiceApp> {
 
   Future<void> _logoutUser() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.clear();
+    // Preserve _formRecovery_* keys so process-death recovery still works
+    final allKeys = prefs.getKeys().toList();
+    for (final key in allKeys) {
+      if (!key.startsWith('_formRecovery_')) {
+        await prefs.remove(key);
+      }
+    }
     navigatorKey.currentState?.pushAndRemoveUntil(
       MaterialPageRoute(builder: (_) => const LoginScreen()),
       (route) => false,

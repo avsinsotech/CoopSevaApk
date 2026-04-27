@@ -2,7 +2,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 class PanVerificationService {
-  final String _baseUrl = 'https://coop360.avsinsotech.com/api/Auth';
+  final String _baseUrl = 'https://swiftkyc.avsinsotech.com/api/Auth';
 
   Future<PanVerificationResult> verifyPan(String panNumber) async {
     final url = Uri.parse('$_baseUrl/verify-pan');

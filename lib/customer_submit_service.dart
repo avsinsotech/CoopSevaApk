@@ -6,7 +6,7 @@ class CustomerSubmitService {
     try {
       final response = await http.post(
         Uri.parse(
-          'https://coop360.avsinsotech.com/api/CustomerProfile/submit-profile',
+          'https://swiftkyc.avsinsotech.com/api/CustomerProfile/submit-profile',
         ),
         headers: {'Content-Type': 'application/json'},
         body: json.encode(data),

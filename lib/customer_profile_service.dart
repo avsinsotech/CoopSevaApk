@@ -4,7 +4,7 @@ import 'package:http/http.dart' as http;
 
 class CustomerProfileService {
   static const String _baseUrl =
-      'https://coop360.avsinsotech.com/api/CustomerProfile';
+      'https://swiftkyc.avsinsotech.com/api/CustomerProfile';
 
   Future<Map<String, dynamic>?> checkExistence(
     String paramName,

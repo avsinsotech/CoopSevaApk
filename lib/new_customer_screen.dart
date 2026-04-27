@@ -157,6 +157,11 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
   bool _isPanLoading = false;
   bool _isOpeningCamera = false;
 
+  // Tracks which image type was being captured when camera launched
+  // Used for process-death recovery via retrieveLostData
+  String?
+  _pendingImageType; // 'photo', 'signature', 'ovd_0', 'ovd_1', 'ovd_2', 'form60', 'aadhaar_back'
+
   final PanVerificationService _panService = PanVerificationService();
 
   bool _isSubmitting = false;
@@ -175,6 +180,8 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
   final ScrollController _scrollController = ScrollController();
 
   XFile? _photoFile;
+  Uint8List?
+  _photoBytes; // ✅ cached bytes — survives temp-file cleanup & Android process death
 
   XFile? _signatureFile;
   Uint8List?
@@ -188,6 +195,11 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
     null,
   ]; // ✅ cached bytes
 
+  // Aadhaar back photo (shared across all OVD slots — one Aadhaar back photo)
+  XFile? _aadhaarBackFile;
+  Uint8List? _aadhaarBackBytesCache;
+  Map<String, String>? _aadhaarBackLocationData;
+
   // ADD THIS LINE to store the location data for each captured OVD image
   final List<Map<String, String>?> _ovdLocationData = [null, null, null];
 
@@ -196,7 +208,58 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
 
   final ImagePicker _picker = ImagePicker();
 
+  // ✅ Safe person-photo capture: concurrency guard + mounted checks + byte caching
+  Future<void> _capturePersonPhoto() async {
+    if (_isOpeningCamera) return;
+    setState(() => _isOpeningCamera = true);
+    try {
+      _pendingImageType = 'photo';
+      await _saveFormStateToPrefs();
+      final picked = await _picker.pickImage(source: ImageSource.camera);
+      if (picked == null || !mounted) return;
+
+      final croppedFile = await ImageCropper().cropImage(
+        sourcePath: picked.path,
+        compressQuality: 80,
+        uiSettings: [
+          AndroidUiSettings(
+            toolbarTitle: 'Crop Photo',
+            toolbarColor: const Color(0xFF0F1E4A),
+            toolbarWidgetColor: Colors.white,
+            lockAspectRatio: false,
+          ),
+          IOSUiSettings(title: 'Crop Photo'),
+        ],
+      );
+
+      if (croppedFile == null || !mounted) return;
+
+      // ✅ Read bytes NOW so the image survives temp-file cleanup
+      final bytes = await File(croppedFile.path).readAsBytes();
+      if (!mounted) return;
+
+      setState(() {
+        _photoFile = XFile(croppedFile.path);
+        _photoBytes = bytes;
+        _profileImageBytes = null; // clear Aadhaar-fetched photo
+      });
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error capturing photo: $e'),
+            backgroundColor: Colors.redAccent,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isOpeningCamera = false);
+    }
+  }
+
   Future<void> _pickSignature(ImageSource source) async {
+    _pendingImageType = 'signature';
+    await _saveFormStateToPrefs();
     final XFile? image = await _picker.pickImage(source: source);
 
     if (image != null) {
@@ -350,6 +413,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
   void _showDocImageOptions({
     required String title,
     required Function(XFile, Map<String, String>) onPicked,
+    String imageType = 'doc',
   }) {
     showModalBottomSheet(
       context: context,
@@ -449,6 +513,8 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                   try {
                     Navigator.pop(context);
 
+                    _pendingImageType = imageType;
+                    await _saveFormStateToPrefs();
                     final picked = await _picker.pickImage(
                       source: ImageSource.camera,
                     );
@@ -487,6 +553,16 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                       if (locationData != null && mounted) {
                         // ✅ Pass cropped image instead of original
                         onPicked(croppedPicked, locationData);
+                      } else if (mounted) {
+                        // ❗ Location fetch failed — show error and discard image
+                        ScaffoldMessenger.of(this.context).showSnackBar(
+                          const SnackBar(
+                            content: Text(
+                              'Failed to fetch location. Please enable GPS and try again.',
+                            ),
+                            backgroundColor: Colors.redAccent,
+                          ),
+                        );
                       }
                     }
                   } finally {
@@ -525,6 +601,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
     required XFile? file,
     required String bottomSheetTitle,
     required Function(XFile, Map<String, String>) onPicked,
+    String imageType = 'doc',
   }) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -539,8 +616,11 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
         ),
         const SizedBox(height: 6),
         GestureDetector(
-          onTap: () =>
-              _showDocImageOptions(title: bottomSheetTitle, onPicked: onPicked),
+          onTap: () => _showDocImageOptions(
+            title: bottomSheetTitle,
+            onPicked: onPicked,
+            imageType: imageType,
+          ),
           child: Container(
             height: 140,
             width: double.infinity,
@@ -570,6 +650,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                           onTap: () => _showDocImageOptions(
                             title: bottomSheetTitle,
                             onPicked: onPicked,
+                            imageType: imageType,
                           ),
                           child: Container(
                             padding: const EdgeInsets.all(6),
@@ -771,6 +852,8 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
     if (widget.initialMobileNumber != null) {
       _mobileNumberController.text = widget.initialMobileNumber!;
     }
+    // Check for images lost during Android process death
+    _retrieveLostData();
   }
 
   void _addNominee() {
@@ -803,42 +886,41 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
     setState(() => _isAadhaarLoading = true);
 
     try {
-      // 1. Check if user already exists (skip in update mode — customer already exists)
-      if (!_isUpdateMode) {
-        final checkResponse = await http.get(
-          Uri.parse(
-            'https://coop360.avsinsotech.com/api/CustomerProfile/check-aadhar/${_aadhaarController.text}',
-          ),
-        );
+      // 1. Check if user already exists
+      final checkResponse = await http.get(
+        Uri.parse(
+          'https://swiftkyc.avsinsotech.com/api/CustomerProfile/check-aadhar/${_aadhaarController.text}',
+        ),
+      );
 
-        if (checkResponse.statusCode == 200) {
-          final checkData = json.decode(checkResponse.body);
-          if (checkData['exists'] == true) {
-            if (mounted) {
-              showDialog(
-                context: context,
-                builder: (ctx) => AlertDialog(
-                  title: const Text('Customer Exists'),
-                  content: const Text(
-                    'User with that aadhar number already exists',
-                  ),
-                  actions: [
-                    TextButton(
-                      onPressed: () => Navigator.pop(ctx),
-                      child: const Text('OK'),
-                    ),
-                  ],
+      if (checkResponse.statusCode == 200) {
+        final checkData = json.decode(checkResponse.body);
+        if (checkData['exists'] == true) {
+          if (mounted) {
+            showDialog(
+              context: context,
+              builder: (ctx) => AlertDialog(
+                title: const Text('Customer Exists'),
+                content: const Text(
+                  'User with that aadhar number already exists',
                 ),
-              );
-            }
-            return; // Stop flow
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(ctx),
+                    child: const Text('OK'),
+                  ),
+                ],
+              ),
+            );
           }
+          setState(() => _isAadhaarLoading = false);
+          return; // Stop flow
         }
       }
 
       // 2. If not exists, send Aadhaar OTP
       final response = await http.post(
-        Uri.parse('https://coop360.avsinsotech.com/api/Auth/send-aadhar-otp'),
+        Uri.parse('https://swiftkyc.avsinsotech.com/api/Auth/send-aadhar-otp'),
 
         headers: {'Content-Type': 'application/json'},
 
@@ -888,7 +970,9 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
 
     try {
       final response = await http.post(
-        Uri.parse('https://coop360.avsinsotech.com/api/Auth/verify-aadhar-otp'),
+        Uri.parse(
+          'https://swiftkyc.avsinsotech.com/api/Auth/verify-aadhar-otp',
+        ),
 
         headers: {'Content-Type': 'application/json'},
 
@@ -1043,7 +1127,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
 
     try {
       final response = await http.post(
-        Uri.parse('https://coop360.avsinsotech.com/api/Auth/send-otp'),
+        Uri.parse('https://swiftkyc.avsinsotech.com/api/Auth/send-otp'),
 
         headers: {'Content-Type': 'application/json'},
 
@@ -1092,7 +1176,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
 
     try {
       final response = await http.post(
-        Uri.parse('https://coop360.avsinsotech.com/api/Auth/verify-otp'),
+        Uri.parse('https://swiftkyc.avsinsotech.com/api/Auth/verify-otp'),
 
         headers: {'Content-Type': 'application/json'},
 
@@ -1203,6 +1287,273 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
     _scrollController.dispose();
 
     super.dispose();
+  }
+
+  // ─── PROCESS DEATH: Save form state before camera ───
+  static const String _recoveryKey = '_formRecovery_newCustomer';
+
+  Future<void> _saveFormStateToPrefs() async {
+    final prefs = await SharedPreferences.getInstance();
+    final Map<String, dynamic> state = {
+      'pendingImageType': _pendingImageType,
+      'currentFormStep': _currentFormStep,
+      'isAadhaarVerified': _isAadhaarVerified,
+      'isPanVerified': _isPanVerified,
+      'mobileOtpState': _mobileOtpState,
+      // Text controllers
+      'aadhaar': _aadhaarController.text,
+      'fullName': _fullNameController.text,
+      'nameMarathi': _nameMarathiController.text,
+      'fatherHusbandName': _fatherHusbandNameController.text,
+      'motherName': _motherNameController.text,
+      'dob': _dobController.text,
+      'religion': _religionController.text,
+      'currentAddress': _currentAddressController.text,
+      'villageCity': _villageCityController.text,
+      'taluka': _talukaController.text,
+      'district': _districtController.text,
+      'state': _stateController.text,
+      'pinCode': _pinCodeController.text,
+      'country': _countryController.text,
+      'permanentAddress': _permanentAddressController.text,
+      'permVillageCity': _permVillageCityController.text,
+      'permTaluka': _permTalukaController.text,
+      'permDistrict': _permDistrictController.text,
+      'permState': _permStateController.text,
+      'permPinCode': _permPinCodeController.text,
+      'permCountry': _permCountryController.text,
+      'panNumber': _panNumberController.text,
+      'aadhaarCkyc': _aadhaarCkycController.text,
+      'mobileNumber': _mobileNumberController.text,
+      'alternateMobile': _alternateMobileController.text,
+      'email': _emailController.text,
+      'employerName': _employerNameController.text,
+      'designation': _designationController.text,
+      // OVD controllers
+      'ovdNumber0': _ovdNumberControllers[0].text,
+      'ovdNumber1': _ovdNumberControllers[1].text,
+      'ovdNumber2': _ovdNumberControllers[2].text,
+      'ovdExpiry0': _ovdExpiryControllers[0].text,
+      'ovdExpiry1': _ovdExpiryControllers[1].text,
+      'ovdExpiry2': _ovdExpiryControllers[2].text,
+      // Dropdowns
+      'selectedGender': _selectedGender,
+      'selectedMaritalStatus': _selectedMaritalStatus,
+      'selectedNationality': _selectedNationality,
+      'selectedResidentialStatus': _selectedResidentialStatus,
+      'selectedCategory': _selectedCategory,
+      'selectedPermanentAddressSame': _selectedPermanentAddressSame,
+      'selectedAddressProof': _selectedAddressProof,
+      'form60Status': _form60Status,
+      'selectedOccupation': _selectedOccupation,
+      'selectedAnnualIncome': _selectedAnnualIncome,
+      'selectedSourceOfFunds': _selectedSourceOfFunds,
+      'selectedPep': _selectedPep,
+      'selectedRelatedPep': _selectedRelatedPep,
+      // OVD config
+      'ovdCount': _ovdCount,
+      'ovdType0': _ovdTypes[0],
+      'ovdType1': _ovdTypes[1],
+      'ovdType2': _ovdTypes[2],
+      // Nominees
+      'nomineeCount': _nominees.length,
+      for (int i = 0; i < _nominees.length; i++) ...{
+        'nominee_${i}_fullName': _nominees[i].fullNameController.text,
+        'nominee_${i}_relationship': _nominees[i].selectedRelationship,
+        'nominee_${i}_otherRelationship':
+            _nominees[i].otherRelationshipController.text,
+        'nominee_${i}_dob': _nominees[i].dobController.text,
+        'nominee_${i}_age': _nominees[i].ageController.text,
+        'nominee_${i}_share': _nominees[i].shareController.text,
+        'nominee_${i}_guardianAddress':
+            _nominees[i].guardianAddressController.text,
+      },
+    };
+    await prefs.setString(_recoveryKey, json.encode(state));
+  }
+
+  void _restoreFormStateFromPrefs(Map<String, dynamic> state) {
+    _currentFormStep = state['currentFormStep'] ?? 0;
+    _isAadhaarVerified = state['isAadhaarVerified'] ?? false;
+    _isPanVerified = state['isPanVerified'] ?? false;
+    _mobileOtpState = state['mobileOtpState'] ?? 0;
+
+    _aadhaarController.text = state['aadhaar'] ?? '';
+    _fullNameController.text = state['fullName'] ?? '';
+    _nameMarathiController.text = state['nameMarathi'] ?? '';
+    _fatherHusbandNameController.text = state['fatherHusbandName'] ?? '';
+    _motherNameController.text = state['motherName'] ?? '';
+    _dobController.text = state['dob'] ?? '';
+    _religionController.text = state['religion'] ?? '';
+    _currentAddressController.text = state['currentAddress'] ?? '';
+    _villageCityController.text = state['villageCity'] ?? '';
+    _talukaController.text = state['taluka'] ?? '';
+    _districtController.text = state['district'] ?? '';
+    _stateController.text = state['state'] ?? '';
+    _pinCodeController.text = state['pinCode'] ?? '';
+    _countryController.text = state['country'] ?? '';
+    _permanentAddressController.text = state['permanentAddress'] ?? '';
+    _permVillageCityController.text = state['permVillageCity'] ?? '';
+    _permTalukaController.text = state['permTaluka'] ?? '';
+    _permDistrictController.text = state['permDistrict'] ?? '';
+    _permStateController.text = state['permState'] ?? '';
+    _permPinCodeController.text = state['permPinCode'] ?? '';
+    _permCountryController.text = state['permCountry'] ?? '';
+    _panNumberController.text = state['panNumber'] ?? '';
+    _aadhaarCkycController.text = state['aadhaarCkyc'] ?? '';
+    _mobileNumberController.text = state['mobileNumber'] ?? '';
+    _alternateMobileController.text = state['alternateMobile'] ?? '';
+    _emailController.text = state['email'] ?? '';
+    _employerNameController.text = state['employerName'] ?? '';
+    _designationController.text = state['designation'] ?? '';
+
+    _ovdNumberControllers[0].text = state['ovdNumber0'] ?? '';
+    _ovdNumberControllers[1].text = state['ovdNumber1'] ?? '';
+    _ovdNumberControllers[2].text = state['ovdNumber2'] ?? '';
+    _ovdExpiryControllers[0].text = state['ovdExpiry0'] ?? '';
+    _ovdExpiryControllers[1].text = state['ovdExpiry1'] ?? '';
+    _ovdExpiryControllers[2].text = state['ovdExpiry2'] ?? '';
+
+    _selectedGender = state['selectedGender'];
+    _selectedMaritalStatus = state['selectedMaritalStatus'];
+    _selectedNationality = state['selectedNationality'];
+    _selectedResidentialStatus = state['selectedResidentialStatus'];
+    _selectedCategory = state['selectedCategory'];
+    _selectedPermanentAddressSame =
+        state['selectedPermanentAddressSame'] ?? 'Same as Current';
+    _selectedAddressProof = state['selectedAddressProof'] ?? 'Yes \u2014 OVD';
+    _form60Status = state['form60Status'] ?? 'N/A';
+    _selectedOccupation = state['selectedOccupation'];
+    _selectedAnnualIncome = state['selectedAnnualIncome'];
+    _selectedSourceOfFunds = state['selectedSourceOfFunds'];
+    _selectedPep = state['selectedPep'];
+    _selectedRelatedPep = state['selectedRelatedPep'];
+
+    _ovdCount = state['ovdCount'] ?? 2;
+    _ovdTypes[0] = state['ovdType0'] ?? 'Aadhaar Card';
+    _ovdTypes[1] = state['ovdType1'];
+    _ovdTypes[2] = state['ovdType2'];
+
+    // Restore nominees
+    final int nomCount = state['nomineeCount'] ?? 1;
+    _nominees.clear();
+    for (int i = 0; i < nomCount; i++) {
+      final n = NomineeEntry();
+      n.fullNameController.text = state['nominee_${i}_fullName'] ?? '';
+      n.selectedRelationship = state['nominee_${i}_relationship'];
+      n.otherRelationshipController.text =
+          state['nominee_${i}_otherRelationship'] ?? '';
+      n.dobController.text = state['nominee_${i}_dob'] ?? '';
+      n.ageController.text = state['nominee_${i}_age'] ?? '';
+      n.shareController.text = state['nominee_${i}_share'] ?? '';
+      n.guardianAddressController.text =
+          state['nominee_${i}_guardianAddress'] ?? '';
+      _nominees.add(n);
+    }
+    if (_nominees.isEmpty) _nominees.add(NomineeEntry());
+  }
+
+  Future<void> _clearFormRecoveryPrefs() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_recoveryKey);
+  }
+
+  // ─── PROCESS DEATH: Recover image lost during camera session ───
+  Future<void> _retrieveLostData() async {
+    try {
+      final LostDataResponse response = await _picker.retrieveLostData();
+      if (response.isEmpty || response.file == null) {
+        // No lost data — clear any stale recovery state
+        await _clearFormRecoveryPrefs();
+        return;
+      }
+
+      final prefs = await SharedPreferences.getInstance();
+      final stateJson = prefs.getString(_recoveryKey);
+      if (stateJson == null) return;
+
+      final Map<String, dynamic> state = json.decode(stateJson);
+      final String? imageType = state['pendingImageType'];
+
+      // Restore all form fields
+      _restoreFormStateFromPrefs(state);
+
+      // Read recovered image bytes
+      final recoveredFile = response.file!;
+      final bytes = await File(recoveredFile.path).readAsBytes();
+
+      // Assign the recovered image to the correct slot
+      switch (imageType) {
+        case 'photo':
+          _photoFile = recoveredFile;
+          _photoBytes = bytes;
+          _profileImageBytes = null;
+          break;
+        case 'signature':
+          _signatureFile = recoveredFile;
+          _signatureBytes = bytes;
+          break;
+        case 'ovd_0':
+          _ovdImageFiles[0] = recoveredFile;
+          _ovdImageBytesCache[0] = bytes;
+          break;
+        case 'ovd_1':
+          _ovdImageFiles[1] = recoveredFile;
+          _ovdImageBytesCache[1] = bytes;
+          break;
+        case 'ovd_2':
+          _ovdImageFiles[2] = recoveredFile;
+          _ovdImageBytesCache[2] = bytes;
+          break;
+        case 'form60':
+          _form60File = recoveredFile;
+          _form60Bytes = bytes;
+          break;
+        case 'aadhaar_back':
+          _aadhaarBackFile = recoveredFile;
+          _aadhaarBackBytesCache = bytes;
+          break;
+      }
+
+      await _clearFormRecoveryPrefs();
+
+      if (mounted) {
+        setState(() {});
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Form restored after camera session'),
+            backgroundColor: Colors.green,
+            duration: Duration(seconds: 3),
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint('retrieveLostData error: $e');
+      await _clearFormRecoveryPrefs();
+    }
+  }
+
+  // ─── OOM FIX: Flush all image memory after successful submission ───
+  void _flushMemory() {
+    _photoFile = null;
+    _photoBytes = null;
+    _signatureFile = null;
+    _signatureBytes = null;
+    _form60File = null;
+    _form60Bytes = null;
+    _profileImageBytes = null;
+    _aadhaarBackFile = null;
+    _aadhaarBackBytesCache = null;
+    for (int i = 0; i < 3; i++) {
+      _ovdImageFiles[i] = null;
+      _ovdImageBytesCache[i] = null;
+      _ovdLocationData[i] = null;
+    }
+    _aadhaarBackLocationData = null;
+
+    // Clear Flutter's image cache to release decoded image memory
+    PaintingBinding.instance.imageCache.clear();
+    PaintingBinding.instance.imageCache.clearLiveImages();
   }
 
   Widget _buildCustomTextField(
@@ -1682,38 +2033,10 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                               color: Color(0xFF0F1E4A),
                             ),
                             title: const Text('Camera Capture'),
-                            onTap: () async {
+                            onTap: () {
+                              // ✅ Dismiss sheet first, then launch camera safely
                               Navigator.pop(ctx);
-
-                              final picked = await _picker.pickImage(
-                                source: ImageSource.camera,
-                              );
-
-                              if (picked != null) {
-                                // ✅ Crop image
-                                final croppedFile = await ImageCropper()
-                                    .cropImage(
-                                      sourcePath: picked.path,
-                                      compressQuality: 80,
-                                      uiSettings: [
-                                        AndroidUiSettings(
-                                          toolbarTitle: 'Crop Image',
-                                          toolbarColor: Color(0xFF0F1E4A),
-                                          toolbarWidgetColor: Colors.white,
-                                        ),
-                                        IOSUiSettings(title: 'Crop Image'),
-                                      ],
-                                    );
-
-                                if (croppedFile == null) return;
-
-                                final croppedPicked = XFile(croppedFile.path);
-
-                                setState(() {
-                                  _photoFile = croppedPicked;
-                                  _profileImageBytes = null;
-                                });
-                              }
+                              _capturePersonPhoto();
                             },
                           ),
 
@@ -1779,17 +2102,14 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                         fit: BoxFit.cover,
                       ),
                     )
-                  : _photoFile != null
+                  : _photoBytes != null
                   ? ClipRRect(
                       borderRadius: BorderRadius.circular(12),
-
-                      child: Image.file(
-                        File(_photoFile!.path),
-
+                      // ✅ Use cached bytes instead of File path — safe after Android process death
+                      child: Image.memory(
+                        _photoBytes!,
                         width: 100,
-
                         height: 100,
-
                         fit: BoxFit.cover,
                       ),
                     )
@@ -3053,6 +3373,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                   label: "FORM 60 / 61",
                   file: _form60File,
                   bottomSheetTitle: "Upload Form 60 / 61",
+                  imageType: 'form60',
                   onPicked: (picked, locData) async {
                     // ✅ Read bytes NOW so temp-file cleanup won't lose them
                     final bytes = await File(picked.path).readAsBytes();
@@ -3290,6 +3611,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                                   }).toList(),
                               onChanged: (val) {
                                 setState(() {
+                                  final oldVal = _ovdTypes[slotIdx];
                                   _ovdTypes[slotIdx] = val;
                                   // Auto-fill number
                                   if (val == "Aadhaar Card" &&
@@ -3311,6 +3633,18 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                                   ];
                                   if (val != null && noExpiry.contains(val)) {
                                     _ovdExpiryControllers[slotIdx].clear();
+                                  }
+                                  // Clear Aadhaar back photo if no slot has Aadhaar
+                                  if (oldVal == "Aadhaar Card" &&
+                                      val != "Aadhaar Card") {
+                                    final bool anyAadhaar = _ovdTypes.any(
+                                      (t) => t == "Aadhaar Card",
+                                    );
+                                    if (!anyAadhaar) {
+                                      _aadhaarBackFile = null;
+                                      _aadhaarBackBytesCache = null;
+                                      _aadhaarBackLocationData = null;
+                                    }
                                   }
                                 });
                               },
@@ -3410,12 +3744,16 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
 
                         const SizedBox(height: 16),
 
-                        // Per-slot document image upload
+                        // Per-slot document image upload (Front)
                         _buildDocUploadField(
-                          label: "OVD ${slotIdx + 1} DOCUMENT IMAGE",
+                          label: _ovdTypes[slotIdx] == "Aadhaar Card"
+                              ? "AADHAAR FRONT IMAGE"
+                              : "OVD ${slotIdx + 1} DOCUMENT IMAGE",
                           file: _ovdImageFiles[slotIdx],
-                          bottomSheetTitle:
-                              "Upload OVD Document ${slotIdx + 1}",
+                          bottomSheetTitle: _ovdTypes[slotIdx] == "Aadhaar Card"
+                              ? "Capture Aadhaar Front"
+                              : "Upload OVD Document ${slotIdx + 1}",
+                          imageType: 'ovd_$slotIdx',
                           onPicked: (picked, locData) async {
                             // ✅ Read bytes NOW so temp-file cleanup won't lose them
                             final bytes = await File(picked.path).readAsBytes();
@@ -3426,6 +3764,27 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                             });
                           },
                         ),
+
+                        // Aadhaar Back photo — only when this slot is Aadhaar Card
+                        if (_ovdTypes[slotIdx] == "Aadhaar Card") ...[
+                          const SizedBox(height: 16),
+                          _buildDocUploadField(
+                            label: "AADHAAR BACK IMAGE",
+                            file: _aadhaarBackFile,
+                            bottomSheetTitle: "Capture Aadhaar Back",
+                            imageType: 'aadhaar_back',
+                            onPicked: (picked, locData) async {
+                              final bytes = await File(
+                                picked.path,
+                              ).readAsBytes();
+                              setState(() {
+                                _aadhaarBackFile = picked;
+                                _aadhaarBackBytesCache = bytes;
+                                _aadhaarBackLocationData = locData;
+                              });
+                            },
+                          ),
+                        ],
                       ],
                     ),
                   ),
@@ -5684,6 +6043,38 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
             );
             return false;
           }
+          // Validate location data for OVD image
+          if (_ovdLocationData[i] == null) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(
+                  'Location data missing for OVD ${i + 1}. Please recapture the image with GPS enabled.',
+                ),
+              ),
+            );
+            return false;
+          }
+          // Validate Aadhaar back photo if this slot is Aadhaar
+          if (_ovdTypes[i] == "Aadhaar Card" && _aadhaarBackFile == null) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text('Please capture Aadhaar Back photo.'),
+              ),
+            );
+            return false;
+          }
+          // Validate location data for Aadhaar back photo
+          if (_ovdTypes[i] == "Aadhaar Card" &&
+              _aadhaarBackLocationData == null) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text(
+                  'Location data missing for Aadhaar Back. Please recapture with GPS enabled.',
+                ),
+              ),
+            );
+            return false;
+          }
         }
         // Validate optional 3rd OVD if added
         if (_ovdCount >= 3) {
@@ -5700,6 +6091,37 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
               ScaffoldMessenger.of(context).showSnackBar(
                 const SnackBar(
                   content: Text('Please upload document image for OVD 3.'),
+                ),
+              );
+              return false;
+            }
+            // Validate location data for OVD 3
+            if (_ovdLocationData[2] == null) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text(
+                    'Location data missing for OVD 3. Please recapture the image with GPS enabled.',
+                  ),
+                ),
+              );
+              return false;
+            }
+            // Validate Aadhaar back photo if OVD 3 is Aadhaar
+            if (_ovdTypes[2] == "Aadhaar Card" && _aadhaarBackFile == null) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text('Please capture Aadhaar Back photo.'),
+                ),
+              );
+              return false;
+            }
+            if (_ovdTypes[2] == "Aadhaar Card" &&
+                _aadhaarBackLocationData == null) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text(
+                    'Location data missing for Aadhaar Back. Please recapture with GPS enabled.',
+                  ),
                 ),
               );
               return false;
@@ -6386,10 +6808,13 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                           return safeBase64(fileObj);
                         }
 
-                        // ✅ Profile image
+                        // ✅ Profile image — prefer cached bytes over file path
                         String pImgBase64 = "";
                         if (_profileImageBytes != null) {
                           pImgBase64 = base64Encode(_profileImageBytes!);
+                        } else if (_photoBytes != null &&
+                            _photoBytes!.isNotEmpty) {
+                          pImgBase64 = base64Encode(_photoBytes!);
                         } else {
                           pImgBase64 = await safeBase64(_photoFile);
                         }
@@ -6415,6 +6840,18 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                           _form60Bytes,
                           _form60File,
                         );
+
+                        // ✅ Aadhaar back photo → ovdImg4Base64
+                        String aadhaarBackBase64 = "";
+                        final bool hasAadhaarOvd = _ovdTypes.any(
+                          (t) => t == "Aadhaar Card",
+                        );
+                        if (hasAadhaarOvd) {
+                          aadhaarBackBase64 = await encodeCached(
+                            _aadhaarBackBytesCache,
+                            _aadhaarBackFile,
+                          );
+                        }
 
                         // ✅ Safe OVD location getter
                         String getLoc(int index, String key) {
@@ -6489,7 +6926,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                           "ovdImg1Base64": o1Base64,
                           "ovdImg2Base64": o2Base64,
                           "ovdImg3Base64": o3Base64,
-                          "ovdImg4Base64": "",
+                          "ovdImg4Base64": aadhaarBackBase64,
                           "form60_61_ImgBase64": f60Base64,
 
                           // Current address
@@ -6727,8 +7164,12 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                                   actions: [
                                     TextButton(
                                       onPressed: () {
-                                        Navigator.pop(context);
-                                        Navigator.pop(context);
+                                        _flushMemory();
+                                        _clearFormRecoveryPrefs();
+                                        Navigator.pop(context); // close dialog
+                                        Navigator.pop(
+                                          context,
+                                        ); // back to caller
                                       },
                                       child: const Text('OK'),
                                     ),
@@ -6775,8 +7216,12 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                                   actions: [
                                     TextButton(
                                       onPressed: () {
-                                        Navigator.pop(context);
-                                        Navigator.pop(context);
+                                        _flushMemory();
+                                        _clearFormRecoveryPrefs();
+                                        Navigator.pop(context); // close dialog
+                                        Navigator.pop(
+                                          context,
+                                        ); // back to caller
                                       },
                                       child: const Text('OK'),
                                     ),
@@ -7407,7 +7852,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
 
                       children: [
                         if (!_isAadhaarVerified) _buildAadhaarVerification(),
-                        // if (!_isAadhaarVerified) _buildPersonalDetails(),
+                        // if (!_isAadhaarVerified) _buildKycDetails(),
                         if (_isAadhaarVerified) _buildForm(),
                       ],
                     ),
