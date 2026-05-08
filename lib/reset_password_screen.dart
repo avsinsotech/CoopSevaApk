@@ -1,82 +1,104 @@
-// import 'package:firebase_crashlytics/firebase_crashlytics.dart';
 import 'package:flutter/material.dart';
 import 'package:form_app_27_3_2026/color_constants.dart';
-import 'package:form_app_27_3_2026/dashboard_screen.dart';
 import 'package:form_app_27_3_2026/login_service.dart';
-import 'package:shared_preferences/shared_preferences.dart';
-import 'package:form_app_27_3_2026/forgot_password_screen.dart';
-// import 'dart:async';
-import 'package:package_info_plus/package_info_plus.dart';
 
-class VersionTrackerText extends StatefulWidget {
-  const VersionTrackerText({super.key, this.darkText = false});
-
-  /// Set to true when the widget is placed on a light background
-  /// (e.g. new/update customer screens) so the text stays readable.
-  final bool darkText;
+class ResetPasswordScreen extends StatefulWidget {
+  final String identifier;
+  const ResetPasswordScreen({super.key, required this.identifier});
 
   @override
-  State<VersionTrackerText> createState() => _VersionTrackerTextState();
+  State<ResetPasswordScreen> createState() => _ResetPasswordScreenState();
 }
 
-class _VersionTrackerTextState extends State<VersionTrackerText> {
-  String _appVersion = "";
+class _ResetPasswordScreenState extends State<ResetPasswordScreen> {
+  final _formKey = GlobalKey<FormState>();
+  final _loginService = LoginService();
+  
+  final _otpController = TextEditingController();
+  final _newPasswordController = TextEditingController();
+  final _confirmPasswordController = TextEditingController();
+  
+  bool _isLoading = false;
+  bool _obscurePassword = true;
+  bool _obscureConfirmPassword = true;
+  
+  double _passwordStrength = 0.0;
+  String _passwordStrengthLabel = '';
+  Color _passwordStrengthColor = Colors.grey;
 
   @override
   void initState() {
     super.initState();
-    _initPackageInfo();
+    _newPasswordController.addListener(_updatePasswordStrength);
   }
-
-  Future<void> _initPackageInfo() async {
-    final info = await PackageInfo.fromPlatform();
-    setState(() {
-      // Combines the version and build number (e.g. "v1.0.0+5")
-      _appVersion = "v${info.version}+${info.buildNumber}";
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 12.0),
-      child: Text(
-        _appVersion,
-        style: TextStyle(
-          fontSize: 10,
-          fontWeight: FontWeight.w300,
-          // Dark bg (login / dashboard) → light grey; light bg → dark grey
-          color: widget.darkText
-              ? const Color.fromARGB(255, 0, 0, 0)
-              : Colors.grey,
-          letterSpacing: 1.2,
-        ),
-        textAlign: TextAlign.center,
-      ),
-    );
-  }
-}
-
-class LoginScreen extends StatefulWidget {
-  const LoginScreen({super.key});
-
-  @override
-  State<LoginScreen> createState() => _LoginScreenState();
-}
-
-class _LoginScreenState extends State<LoginScreen> {
-  final _formKey = GlobalKey<FormState>();
-  final _loginService = LoginService();
-  final _usernameController = TextEditingController();
-  final _passwordController = TextEditingController();
-  bool _isLoading = false;
-  bool _obscurePassword = true;
 
   @override
   void dispose() {
-    _usernameController.dispose();
-    _passwordController.dispose();
+    _newPasswordController.removeListener(_updatePasswordStrength);
+    _otpController.dispose();
+    _newPasswordController.dispose();
+    _confirmPasswordController.dispose();
     super.dispose();
+  }
+
+  void _updatePasswordStrength() {
+    final password = _newPasswordController.text;
+    if (password.isEmpty) {
+      setState(() {
+        _passwordStrength = 0.0;
+        _passwordStrengthLabel = '';
+        _passwordStrengthColor = Colors.grey;
+      });
+      return;
+    }
+
+    int score = 0;
+    if (password.length >= 6) score++;
+    if (RegExp(r'[A-Z]').hasMatch(password)) score++;
+    if (RegExp(r'[0-9]').hasMatch(password)) score++;
+    if (RegExp(r'[!@#\$&*~_%\^<>\?]').hasMatch(password)) score++;
+
+    setState(() {
+      _passwordStrength = score / 4;
+      switch (score) {
+        case 0:
+        case 1:
+          _passwordStrengthLabel = 'Weak';
+          _passwordStrengthColor = Colors.red;
+          break;
+        case 2:
+          _passwordStrengthLabel = 'Fair';
+          _passwordStrengthColor = Colors.orange;
+          break;
+        case 3:
+          _passwordStrengthLabel = 'Good';
+          _passwordStrengthColor = Colors.lightGreen;
+          break;
+        case 4:
+          _passwordStrengthLabel = 'Strong';
+          _passwordStrengthColor = Colors.green;
+          break;
+      }
+    });
+  }
+
+  String? _validatePassword(String? value) {
+    if (value == null || value.isEmpty) {
+      return "Required";
+    }
+    if (value.length < 6 || value.length > 18) {
+      return "Password must be 6 to 18 characters long";
+    }
+    if (!RegExp(r'[A-Z]').hasMatch(value)) {
+      return "Must contain at least one uppercase letter";
+    }
+    if (!RegExp(r'[0-9]').hasMatch(value)) {
+      return "Must contain at least one digit";
+    }
+    if (!RegExp(r'[!@#\$&*~_%\^<>\?]').hasMatch(value)) {
+      return "Must contain at least one special character";
+    }
+    return null;
   }
 
   @override
@@ -85,6 +107,15 @@ class _LoginScreenState extends State<LoginScreen> {
 
     return Scaffold(
       backgroundColor: AppColors.bgGrey,
+      appBar: AppBar(
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back, color: Colors.white),
+          onPressed: () => Navigator.pop(context),
+        ),
+      ),
+      extendBodyBehindAppBar: true,
       body: SingleChildScrollView(
         child: ConstrainedBox(
           constraints: BoxConstraints(minHeight: size.height),
@@ -118,18 +149,18 @@ class _LoginScreenState extends State<LoginScreen> {
               Padding(
                 padding: const EdgeInsets.symmetric(
                   horizontal: 24,
-                  vertical: 80,
+                  vertical: 100,
                 ),
                 child: Column(
                   children: [
                     const Icon(
-                      Icons.lock_person,
+                      Icons.security,
                       color: Colors.white,
                       size: 60,
                     ),
                     const SizedBox(height: 20),
                     const Text(
-                      "WELCOME BACK",
+                      "RESET PASSWORD",
                       style: TextStyle(
                         fontSize: 26,
                         fontWeight: FontWeight.w900,
@@ -139,7 +170,7 @@ class _LoginScreenState extends State<LoginScreen> {
                     ),
                     const SizedBox(height: 8),
                     const Text(
-                      "Login to continue",
+                      "Enter OTP and set a new secure password",
                       style: TextStyle(color: Colors.white70, fontSize: 14),
                     ),
                     const SizedBox(height: 40),
@@ -162,37 +193,38 @@ class _LoginScreenState extends State<LoginScreen> {
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            _buildLabel("Username"),
+                            _buildLabel("OTP Code"),
                             TextFormField(
-                              controller: _usernameController,
-                              keyboardType: TextInputType.text,
+                              controller: _otpController,
+                              keyboardType: TextInputType.number,
+                              maxLength: 6,
                               decoration: _inputDecoration(
-                                "Enter Username",
-                                Icons.person_outline,
+                                "Enter 6-digit OTP",
+                                Icons.pin,
                               ),
                               validator: (val) {
                                 if (val == null || val.trim().isEmpty) {
                                   return "Required";
                                 }
+                                if (val.trim().length != 6) {
+                                  return "OTP must be 6 digits";
+                                }
                                 return null;
                               },
                             ),
-                            const SizedBox(height: 20),
+                            const SizedBox(height: 15),
 
-                            _buildLabel("Password"),
+                            _buildLabel("New Password"),
                             TextFormField(
-                              controller: _passwordController,
-                              keyboardType: TextInputType.visiblePassword,
+                              controller: _newPasswordController,
                               obscureText: _obscurePassword,
-                              enabled: !_isLoading,
+                              keyboardType: TextInputType.visiblePassword,
                               decoration: _inputDecoration(
-                                "Enter Password",
+                                "Enter New Password",
                                 Icons.lock_outline,
                                 suffixIcon: IconButton(
                                   icon: Icon(
-                                    _obscurePassword
-                                        ? Icons.visibility_off
-                                        : Icons.visibility,
+                                    _obscurePassword ? Icons.visibility_off : Icons.visibility,
                                     color: AppColors.darkNavy,
                                   ),
                                   onPressed: () {
@@ -202,44 +234,71 @@ class _LoginScreenState extends State<LoginScreen> {
                                   },
                                 ),
                               ),
+                              validator: _validatePassword,
+                            ),
+                            
+                            // Password Strength Indicator
+                            if (_newPasswordController.text.isNotEmpty)
+                              Padding(
+                                padding: const EdgeInsets.only(top: 8.0, left: 4.0),
+                                child: Row(
+                                  children: [
+                                    Expanded(
+                                      child: LinearProgressIndicator(
+                                        value: _passwordStrength,
+                                        backgroundColor: Colors.grey.shade200,
+                                        color: _passwordStrengthColor,
+                                        minHeight: 6,
+                                        borderRadius: BorderRadius.circular(3),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 10),
+                                    Text(
+                                      _passwordStrengthLabel,
+                                      style: TextStyle(
+                                        color: _passwordStrengthColor,
+                                        fontSize: 12,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              
+                            const SizedBox(height: 20),
+
+                            _buildLabel("Confirm Password"),
+                            TextFormField(
+                              controller: _confirmPasswordController,
+                              obscureText: _obscureConfirmPassword,
+                              keyboardType: TextInputType.visiblePassword,
+                              decoration: _inputDecoration(
+                                "Confirm New Password",
+                                Icons.lock_outline,
+                                suffixIcon: IconButton(
+                                  icon: Icon(
+                                    _obscureConfirmPassword ? Icons.visibility_off : Icons.visibility,
+                                    color: AppColors.darkNavy,
+                                  ),
+                                  onPressed: () {
+                                    setState(() {
+                                      _obscureConfirmPassword = !_obscureConfirmPassword;
+                                    });
+                                  },
+                                ),
+                              ),
                               validator: (val) {
-                                if (val == null || val.trim().isEmpty)
+                                if (val == null || val.trim().isEmpty) {
                                   return "Required";
+                                }
+                                if (val != _newPasswordController.text) {
+                                  return "Passwords do not match";
+                                }
                                 return null;
                               },
                             ),
-                            const SizedBox(height: 10),
+                            const SizedBox(height: 40),
 
-                            Align(
-                              alignment: Alignment.centerRight,
-                              child: TextButton(
-                                onPressed: () {
-                                  Navigator.push(
-                                    context,
-                                    MaterialPageRoute(
-                                      builder: (_) =>
-                                          const ForgotPasswordScreen(),
-                                    ),
-                                  );
-                                },
-                                child: Text(
-                                  "Forgot Password?",
-                                  style: TextStyle(
-                                    color: AppColors.darkNavy,
-                                    fontWeight: FontWeight.bold,
-                                  ),
-                                ),
-                              ),
-                            ),
-                            const SizedBox(height: 20),
-
-                            // ElevatedButton(
-                            //   onPressed: () {
-                            //     // This will force a fatal crash to test Firebase Crashlytics
-                            //     FirebaseCrashlytics.instance.crash();
-                            //   },
-                            //   child: const Text("Test Crashlytics"),
-                            // ),
                             SizedBox(
                               width: double.infinity,
                               height: 55,
@@ -258,11 +317,11 @@ class _LoginScreenState extends State<LoginScreen> {
                                             _isLoading = true;
                                           });
 
-                                          final result = await _loginService
-                                              .login(
-                                                _usernameController.text,
-                                                _passwordController.text,
-                                              );
+                                          final result = await _loginService.resetPassword(
+                                            widget.identifier,
+                                            _otpController.text.trim(),
+                                            _newPasswordController.text,
+                                          );
 
                                           if (mounted) {
                                             setState(() {
@@ -270,67 +329,22 @@ class _LoginScreenState extends State<LoginScreen> {
                                             });
 
                                             if (result.success) {
-                                              ScaffoldMessenger.of(
-                                                context,
-                                              ).showSnackBar(
+                                              ScaffoldMessenger.of(context).showSnackBar(
                                                 SnackBar(
                                                   content: Text(result.message),
                                                   backgroundColor: Colors.green,
-                                                  duration: const Duration(
-                                                    seconds: 2,
-                                                  ),
+                                                  duration: const Duration(seconds: 2),
                                                 ),
                                               );
-
-                                              final prefs =
-                                                  await SharedPreferences.getInstance();
-                                              await prefs.setBool(
-                                                'isLoggedIn',
-                                                true,
-                                              );
-                                              if (result.userID != null) {
-                                                await prefs.setInt(
-                                                  'userID',
-                                                  result.userID!,
-                                                );
-                                              }
-                                              if (result.username != null) {
-                                                await prefs.setString(
-                                                  'username',
-                                                  result.username!,
-                                                );
-                                              }
-                                              if (result.fullName != null) {
-                                                await prefs.setString(
-                                                  'fullName',
-                                                  result.fullName!,
-                                                );
-                                              }
-                                              if (result.branchName != null) {
-                                                await prefs.setString(
-                                                  'branchName',
-                                                  result.branchName!,
-                                                );
-                                              }
-
-                                              if (!mounted) return;
-                                              Navigator.pushReplacement(
-                                                context,
-                                                MaterialPageRoute(
-                                                  builder: (_) =>
-                                                      const DashboardScreen(),
-                                                ),
-                                              );
+                                              
+                                              // Pop back to login screen
+                                              Navigator.of(context).popUntil((route) => route.isFirst);
                                             } else {
-                                              ScaffoldMessenger.of(
-                                                context,
-                                              ).showSnackBar(
+                                              ScaffoldMessenger.of(context).showSnackBar(
                                                 SnackBar(
                                                   content: Text(result.message),
                                                   backgroundColor: Colors.red,
-                                                  duration: const Duration(
-                                                    seconds: 3,
-                                                  ),
+                                                  duration: const Duration(seconds: 3),
                                                 ),
                                               );
                                             }
@@ -353,7 +367,7 @@ class _LoginScreenState extends State<LoginScreen> {
                                             ),
                                           )
                                         : const Text(
-                                            "LOGIN",
+                                            "RESET PASSWORD",
                                             style: TextStyle(
                                               color: Colors.white,
                                               fontSize: 16,
@@ -365,8 +379,6 @@ class _LoginScreenState extends State<LoginScreen> {
                                 ),
                               ),
                             ),
-                            const SizedBox(height: 5),
-                            Center(child: const VersionTrackerText()),
                           ],
                         ),
                       ),
@@ -395,13 +407,10 @@ class _LoginScreenState extends State<LoginScreen> {
     );
   }
 
-  InputDecoration _inputDecoration(
-    String hint,
-    IconData icon, {
-    Widget? suffixIcon,
-  }) {
+  InputDecoration _inputDecoration(String hint, IconData icon, {Widget? suffixIcon}) {
     return InputDecoration(
       hintText: hint,
+      counterText: "", // Hide character counter for OTP field
       prefixIcon: Icon(icon, color: AppColors.darkNavy),
       suffixIcon: suffixIcon,
       filled: true,

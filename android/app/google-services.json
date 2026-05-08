@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "758503489032",
+    "project_id": "coopseva-761a1",
+    "storage_bucket": "coopseva-761a1.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:758503489032:android:607a8be669d89c716a9bbd",
+        "android_client_info": {
+          "package_name": "com.example.form_app_27_3_2026"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCNV3mtBFP1s9yrZKeQgV6BjpqFL-_LeQY"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

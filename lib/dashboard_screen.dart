@@ -292,7 +292,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
                           );
                         }),
 
-                        const SizedBox(height: 32),
+                        const SizedBox(height: 16),
+
+                        Center(child: const VersionTrackerText()),
                       ],
                     ),
                   ),

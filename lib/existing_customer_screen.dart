@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:form_app_27_3_2026/color_constants.dart';
 import 'package:form_app_27_3_2026/customer_profile_service.dart';
 import 'package:form_app_27_3_2026/update_customer_screen.dart';
@@ -32,7 +33,7 @@ class _ExistingCustomerScreenState extends State<ExistingCustomerScreen> {
   Uint8List? _form60Img;
 
   Future<void> _fetchCustomer() async {
-    final valueText = _searchController.text.trim();
+    final valueText = _searchController.text.trim().toUpperCase();
     if (valueText.isEmpty) {
       _showSnack('Please enter a value to search');
       return;
@@ -233,8 +234,12 @@ class _ExistingCustomerScreenState extends State<ExistingCustomerScreen> {
                         color: Colors.white70,
                       ),
                       onChanged: (String? newValue) {
-                        if (newValue != null)
-                          setState(() => _searchType = newValue);
+                        if (newValue != null) {
+                          setState(() {
+                            _searchType = newValue;
+                            _searchController.clear();
+                          });
+                        }
                       },
                       items: <String>['Customer ID', 'Aadhaar', 'PAN', 'CIF ID']
                           .map<DropdownMenuItem<String>>((String value) {
@@ -267,12 +272,23 @@ class _ExistingCustomerScreenState extends State<ExistingCustomerScreen> {
                       color: Colors.black,
                       letterSpacing: 1.2,
                     ),
+                    textCapitalization: _searchType == 'PAN' 
+                        ? TextCapitalization.characters 
+                        : TextCapitalization.none,
                     keyboardType: _searchType == 'PAN'
                         ? TextInputType.text
                         : TextInputType.number,
+                    maxLength: _searchType == 'Aadhaar' ? 12 : (_searchType == 'PAN' ? 10 : null),
+                    inputFormatters: [
+                      if (_searchType == 'Aadhaar')
+                        FilteringTextInputFormatter.digitsOnly,
+                      if (_searchType == 'PAN')
+                        FilteringTextInputFormatter.allow(RegExp(r'[a-zA-Z0-9]')),
+                    ],
                     onSubmitted: (_) => _fetchCustomer(),
                     decoration: InputDecoration(
                       hintText: 'Enter $_searchType…',
+                      counterText: "",
                       hintStyle: const TextStyle(color: Colors.black54),
                       border: InputBorder.none,
                       enabledBorder: InputBorder.none,

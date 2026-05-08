@@ -1,10 +1,14 @@
 import 'dart:io';
+import 'package:form_app_27_3_2026/login_screen.dart';
 import 'dart:ui';
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 import 'package:http/http.dart' as http;
 import 'package:form_app_27_3_2026/customer_profile_service.dart';
 import 'package:flutter/material.dart';
+import 'package:form_app_27_3_2026/widgets/image_upload_preview.dart';
+import 'package:form_app_27_3_2026/image_preview_screen.dart';
 import 'package:form_app_27_3_2026/color_constants.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:image_cropper/image_cropper.dart';
@@ -145,8 +149,14 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
   bool _isAadhaarVerified = false; //testing
 
   bool _isOtpSent = false;
+  int _otpVerifyAttempts = 0;
 
   bool _isAadhaarLoading = false;
+
+  String? _aadhaarClientId;
+
+  int _aadhaarResendTimer = 0;
+  Timer? _aadhaarTimerObj;
 
   Uint8List? _profileImageBytes;
 
@@ -208,14 +218,159 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
 
   final ImagePicker _picker = ImagePicker();
 
-  // ✅ Safe person-photo capture: concurrency guard + mounted checks + byte caching
+  /// Tracks which image slots are currently uploading.
+  /// Slot keys match those passed to `_uploadImageInstantly` (e.g. "PHOTO", "Signature", "FORM60").
+  final Set<String> _uploadingSlots = {};
+
+  void _showErrorPopup(String message) {
+    if (mounted) {
+      showDialog(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Error'),
+          content: Text(message),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('OK'),
+            ),
+          ],
+        ),
+      );
+    }
+  }
+
+  /// Helper widget for the name-mismatch dialog rows.
+  Widget _nameMismatchRow({
+    required String label,
+    required String name,
+    required Color color,
+  }) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.07),
+        border: Border.all(color: color.withOpacity(0.4)),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+              color: color,
+              letterSpacing: 0.5,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            name.isNotEmpty ? name : '—',
+            style: const TextStyle(
+              fontSize: 14,
+              fontWeight: FontWeight.bold,
+              color: Colors.black87,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<bool> _uploadImageInstantly({
+    required String imageSlot,
+    required String documentType,
+    required String documentNumber,
+    required Uint8List imageBytes,
+    required String? expiryDate,
+    required Map<String, String>? locationData,
+  }) async {
+    try {
+      final String base64Image = base64Encode(imageBytes);
+      final String captureDate =
+          locationData?["captureDate"] ??
+          DateTime.now()
+              .toUtc()
+              .add(const Duration(hours: 5, minutes: 30))
+              .toIso8601String();
+      final String latitude = locationData?["latitude"] ?? "";
+      final String longitude = locationData?["longitude"] ?? "";
+      final String location = locationData?["location"] ?? "";
+
+      String? formattedExpiry;
+      if (expiryDate != null && expiryDate.isNotEmpty) {
+        final clean = expiryDate.trim().replaceAll('/', '-');
+        final parts = clean.split('-');
+        if (parts.length == 2) {
+          // Expected input: MM-YYYY or MM/YYYY -> convert to YYYY-MM-01
+          formattedExpiry = "${parts[1]}-${parts[0]}-01";
+        } else {
+          formattedExpiry = expiryDate; // fallback
+        }
+      }
+
+      final String refId = _isUpdateMode
+          ? (widget.existingCustomerData!['referenceID'] ??
+                    widget.existingCustomerData!['customerId'] ??
+                    "0")
+                .toString()
+          : "0";
+
+      final String tempId = _isUpdateMode ? "0" : _tempTransactionId;
+
+      final payload = {
+        "referenceID": refId,
+        "tempTransactionId": tempId,
+        "imageSlot": imageSlot,
+        "documentType": documentType,
+        "documentNumber": documentNumber,
+        "expiryDate": formattedExpiry,
+        "imageBase64": base64Image,
+        "captureDate": captureDate,
+        "latitude": latitude,
+        "longitude": longitude,
+        "location": location,
+        "formType": "Standard",
+      };
+
+      final response = await http.post(
+        Uri.parse(
+          'https://swiftkyc.avsinsotech.com/api/CustomerProfile/upload-image',
+        ),
+        headers: {'Content-Type': 'application/json'},
+        body: json.encode(payload),
+      );
+
+      print("Upload Response: ${response.body}");
+      print("Upload Status Code: ${response.statusCode}");
+
+      if (response.statusCode == 200 || response.statusCode == 201) {
+        return true;
+      } else {
+        debugPrint("Instant upload failed for \$imageSlot: \${response.body}");
+        return false;
+      }
+    } catch (e) {
+      debugPrint("Instant upload error for \$imageSlot: \$e");
+      return false;
+    }
+  }
+
   Future<void> _capturePersonPhoto() async {
     if (_isOpeningCamera) return;
     setState(() => _isOpeningCamera = true);
     try {
       _pendingImageType = 'photo';
       await _saveFormStateToPrefs();
-      final picked = await _picker.pickImage(source: ImageSource.camera);
+      final picked = await _picker.pickImage(
+        source: ImageSource.camera,
+        imageQuality: 50,
+        maxWidth: 1080,
+        maxHeight: 1080,
+      );
       if (picked == null || !mounted) return;
 
       final croppedFile = await ImageCropper().cropImage(
@@ -234,17 +389,46 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
 
       if (croppedFile == null || !mounted) return;
 
-      // ✅ Read bytes NOW so the image survives temp-file cleanup
       final bytes = await File(croppedFile.path).readAsBytes();
       if (!mounted) return;
 
-      setState(() {
-        _photoFile = XFile(croppedFile.path);
-        _photoBytes = bytes;
-        _profileImageBytes = null; // clear Aadhaar-fetched photo
-      });
+      // Show spinner immediately — location fetch + upload both take time
+      setState(() => _uploadingSlots.add('PHOTO'));
+
+      final locationData = await _getLocationData(context);
+      if (locationData == null ||
+          locationData.isEmpty ||
+          locationData["latitude"] == null) {
+        if (mounted) setState(() => _uploadingSlots.remove('PHOTO'));
+        _showErrorPopup(
+          "Location not captured. Please enable location services and try again.",
+        );
+        return;
+      }
+
+      final bool success = await _uploadImageInstantly(
+        imageSlot: "PHOTO",
+        documentType: "Profile Photo",
+        documentNumber: "",
+        imageBytes: bytes,
+        expiryDate: "",
+        locationData: locationData,
+      );
+      if (!mounted) return;
+      setState(() => _uploadingSlots.remove('PHOTO'));
+
+      if (success && mounted) {
+        setState(() {
+          _photoFile = XFile(croppedFile.path);
+          _photoBytes = bytes; // ← cache bytes so preview renders
+          _profileImageBytes = null; // ← clear Aadhaar-fetched photo
+        });
+      } else if (mounted) {
+        _showErrorPopup("Image upload failed. Please try again.");
+      }
     } catch (e) {
       if (mounted) {
+        setState(() => _uploadingSlots.remove('PHOTO'));
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text('Error capturing photo: $e'),
@@ -260,36 +444,61 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
   Future<void> _pickSignature(ImageSource source) async {
     _pendingImageType = 'signature';
     await _saveFormStateToPrefs();
-    final XFile? image = await _picker.pickImage(source: source);
+    final XFile? image = await _picker.pickImage(
+      source: source,
+      imageQuality: 50,
+      maxWidth: 1080,
+      maxHeight: 1080,
+    );
 
     if (image != null) {
       final CroppedFile? croppedFile = await ImageCropper().cropImage(
         sourcePath: image.path,
-
         uiSettings: [
           AndroidUiSettings(
             toolbarTitle: 'Crop Signature',
-
             toolbarColor: const Color(0xFF0F1E4A),
-
             toolbarWidgetColor: Colors.white,
-
             initAspectRatio: CropAspectRatioPreset.original,
-
             lockAspectRatio: false,
           ),
-
           IOSUiSettings(title: 'Crop Signature'),
         ],
       );
 
       if (croppedFile != null) {
-        // ✅ Read bytes NOW so they survive temp-file cleanup
         final bytes = await File(croppedFile.path).readAsBytes();
-        setState(() {
-          _signatureFile = XFile(croppedFile.path);
-          _signatureBytes = bytes;
-        });
+
+        final locationData = await _getLocationData(context);
+        if (locationData == null ||
+            locationData.isEmpty ||
+            locationData["latitude"] == null) {
+          _showErrorPopup(
+            "Location not captured. Please enable location services and try again.",
+          );
+          return;
+        }
+
+        if (!mounted) return;
+        setState(() => _uploadingSlots.add('Signature'));
+        final bool success = await _uploadImageInstantly(
+          imageSlot: "SIGNATURE",
+          documentType: "Signature",
+          documentNumber: "",
+          imageBytes: bytes,
+          expiryDate: "",
+          locationData: locationData,
+        );
+        if (!mounted) return;
+        setState(() => _uploadingSlots.remove('Signature'));
+
+        if (success && mounted) {
+          setState(() {
+            _signatureFile = XFile(croppedFile.path);
+          });
+        } else if (mounted) {
+          _showErrorPopup("Image upload failed. Please try again.");
+        }
       }
     }
   }
@@ -355,8 +564,11 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
       debugPrint('Error getting placemark: $e');
     }
 
-    // 5. Get current ISO date
-    String currentDate = DateTime.now().toUtc().toIso8601String();
+    // 5. Get current IST date (UTC+5:30)
+    final String currentDate = DateTime.now()
+        .toUtc()
+        .add(const Duration(hours: 5, minutes: 30))
+        .toIso8601String();
 
     return {
       "latitude": position.latitude.toString(),
@@ -515,8 +727,15 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
 
                     _pendingImageType = imageType;
                     await _saveFormStateToPrefs();
+                    // final picked = await _picker.pickImage(
+                    //   source: ImageSource.camera,
+                    // );
+
                     final picked = await _picker.pickImage(
                       source: ImageSource.camera,
+                      imageQuality: 50,
+                      maxWidth: 1080,
+                      maxHeight: 1080,
                     );
 
                     if (picked != null && mounted) {
@@ -602,7 +821,10 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
     required String bottomSheetTitle,
     required Function(XFile, Map<String, String>) onPicked,
     String imageType = 'doc',
+    String? uploadSlotKey,
   }) {
+    final bool isUploading =
+        uploadSlotKey != null && _uploadingSlots.contains(uploadSlotKey);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -616,77 +838,17 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
         ),
         const SizedBox(height: 6),
         GestureDetector(
-          onTap: () => _showDocImageOptions(
-            title: bottomSheetTitle,
-            onPicked: onPicked,
-            imageType: imageType,
-          ),
-          child: Container(
-            height: 140,
-            width: double.infinity,
-            decoration: BoxDecoration(
-              color: Colors.white,
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: Colors.grey.shade300, width: 1.5),
-            ),
-            child: file != null
-                ? Stack(
-                    children: [
-                      Center(
-                        child: ClipRRect(
-                          borderRadius: BorderRadius.circular(12),
-                          child: Image.file(
-                            File(file.path),
-                            fit: BoxFit.contain,
-                            width: double.infinity,
-                            height: double.infinity,
-                          ),
-                        ),
-                      ),
-                      Positioned(
-                        top: 8,
-                        right: 8,
-                        child: GestureDetector(
-                          onTap: () => _showDocImageOptions(
-                            title: bottomSheetTitle,
-                            onPicked: onPicked,
-                            imageType: imageType,
-                          ),
-                          child: Container(
-                            padding: const EdgeInsets.all(6),
-                            decoration: const BoxDecoration(
-                              color: Colors.black54,
-                              shape: BoxShape.circle,
-                            ),
-                            child: const Icon(
-                              Icons.edit,
-                              color: Colors.white,
-                              size: 16,
-                            ),
-                          ),
-                        ),
-                      ),
-                    ],
-                  )
-                : Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      const Icon(
-                        Icons.document_scanner,
-                        color: Color(0xFF233C67),
-                        size: 36,
-                      ),
-                      const SizedBox(height: 8),
-                      Text(
-                        'Tap to Capture or Upload\n$label',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          color: Colors.grey.shade600,
-                          fontSize: 13,
-                        ),
-                      ),
-                    ],
-                  ),
+          onTap: isUploading
+              ? null
+              : () => _showDocImageOptions(
+                  title: bottomSheetTitle,
+                  onPicked: onPicked,
+                  imageType: imageType,
+                ),
+          child: ImageUploadPreview(
+            isUploading: isUploading,
+            imageFile: file,
+            emptyLabel: 'Tap to Capture or Upload\n$label',
           ),
         ),
       ],
@@ -818,7 +980,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
 
   String? _selectedMaritalStatus;
 
-  String? _selectedNationality;
+  String? _selectedNationality = "Indian";
 
   String? _selectedResidentialStatus;
 
@@ -846,14 +1008,44 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
 
   String? _selectedRelatedPep;
 
+  String _tempTransactionId = "";
+
+  void _generateTempTransactionId() {
+    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    final random = Random.secure();
+    _tempTransactionId = List.generate(
+      12,
+      (index) => chars[random.nextInt(chars.length)],
+    ).join();
+  }
+
   @override
   void initState() {
     super.initState();
+    _generateTempTransactionId();
     if (widget.initialMobileNumber != null) {
       _mobileNumberController.text = widget.initialMobileNumber!;
     }
     // Check for images lost during Android process death
     _retrieveLostData();
+    _checkAadhaarTimer();
+  }
+
+  Future<void> _checkAadhaarTimer() async {
+    final prefs = await SharedPreferences.getInstance();
+    final endTime = prefs.getInt('aadhaar_timer_end');
+    if (endTime != null) {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      if (endTime > now) {
+        final remainingSeconds = ((endTime - now) / 1000).ceil();
+        if (mounted) {
+          setState(() {
+            _aadhaarResendTimer = remainingSeconds;
+          });
+          _startAadhaarResendTimer(resume: true);
+        }
+      }
+    }
   }
 
   void _addNominee() {
@@ -872,7 +1064,37 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
     }
   }
 
+  void _startAadhaarResendTimer({bool resume = false}) async {
+    _aadhaarTimerObj?.cancel();
+    if (!resume) {
+      setState(() {
+        _aadhaarResendTimer = 60;
+      });
+      final prefs = await SharedPreferences.getInstance();
+      final endTime = DateTime.now()
+          .add(const Duration(seconds: 60))
+          .millisecondsSinceEpoch;
+      prefs.setInt('aadhaar_timer_end', endTime);
+    }
+    _aadhaarTimerObj = Timer.periodic(const Duration(seconds: 1), (timer) {
+      if (!mounted) {
+        timer.cancel();
+        return;
+      }
+      setState(() {
+        if (_aadhaarResendTimer > 0) {
+          _aadhaarResendTimer--;
+        } else {
+          timer.cancel();
+        }
+      });
+    });
+  }
+
   Future<void> _sendOtp() async {
+    if (_isAadhaarLoading) return;
+    ScaffoldMessenger.of(context).clearSnackBars();
+
     if (_aadhaarController.text.length != 12) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
@@ -883,6 +1105,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
       return;
     }
 
+    if (!mounted) return;
     setState(() => _isAadhaarLoading = true);
 
     try {
@@ -913,7 +1136,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
               ),
             );
           }
-          setState(() => _isAadhaarLoading = false);
+          if (mounted) setState(() => _isAadhaarLoading = false);
           return; // Stop flow
         }
       }
@@ -928,9 +1151,15 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
       );
 
       if (response.statusCode == 200 || response.statusCode == 201) {
-        setState(() {
-          _isOtpSent = true;
-        });
+        final respData = json.decode(response.body);
+        if (mounted) {
+          setState(() {
+            _isOtpSent = true;
+            _otpVerifyAttempts = 0;
+            _aadhaarClientId = respData['clientId'];
+          });
+        }
+        _startAadhaarResendTimer();
 
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
@@ -940,24 +1169,48 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
           ),
         );
       } else {
+        String errorMsg = 'Failed to send OTP. Please try again.';
+        try {
+          final errData = json.decode(response.body);
+          if (errData['message'] != null) {
+            errorMsg = errData['message'];
+          }
+        } catch (_) {}
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Failed to send OTP: ${response.body}'),
-
-            backgroundColor: Colors.red,
-          ),
+          SnackBar(content: Text(errorMsg), backgroundColor: Colors.red),
         );
       }
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red),
+        const SnackBar(
+          content: Text(
+            'Network error or server unreachable. Please try again.',
+          ),
+          backgroundColor: Colors.red,
+        ),
       );
     } finally {
-      setState(() => _isAadhaarLoading = false);
+      if (mounted) setState(() => _isAadhaarLoading = false);
     }
   }
 
   Future<void> _verifyOtp() async {
+    if (_isAadhaarLoading) return;
+    ScaffoldMessenger.of(context).clearSnackBars();
+
+    if (_otpVerifyAttempts >= 4) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Maximum attempts reached. Please wait for timer to expire to request a new OTP.',
+          ),
+          backgroundColor: Colors.red,
+        ),
+      );
+      setState(() => _isAadhaarLoading = false);
+      return;
+    }
+
     if (_otpController.text.length != 6) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Please enter a valid 6-digit OTP')),
@@ -966,7 +1219,32 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
       return;
     }
 
+    if (!mounted) return;
     setState(() => _isAadhaarLoading = true);
+
+    void handleFailure(String msg) {
+      _otpVerifyAttempts++;
+      if (_otpVerifyAttempts >= 4) {
+        setState(() {
+          _otpController.clear();
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Maximum attempts reached. Please wait for timer to expire to request a new OTP.',
+            ),
+            backgroundColor: Colors.red,
+          ),
+        );
+      } else {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('$msg (Attempt $_otpVerifyAttempts of 4)'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
 
     try {
       final response = await http.post(
@@ -980,19 +1258,48 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
           "aadharNo": _aadhaarController.text,
 
           "otp": _otpController.text,
+
+          if (_aadhaarClientId != null) "clientId": _aadhaarClientId,
         }),
       );
 
       if (response.statusCode == 200 || response.statusCode == 201) {
         final respData = json.decode(response.body);
 
+        // Prevent bypass if the backend returns a 200 OK for a logical error
+        // (e.g., "Maximum attempts exceeded" or "Invalid OTP")
+        final message = respData['message']?.toString().toLowerCase() ?? '';
+        final hasError =
+            respData['status'] == false ||
+            respData['error'] != null ||
+            message.contains('invalid') ||
+            message.contains('incorrect') ||
+            message.contains('fail') ||
+            message.contains('exceed') ||
+            message.contains('lock');
+
+        if (hasError) {
+          handleFailure(
+            respData['message'] ?? 'Verification Failed. Please try again.',
+          );
+          return;
+        }
+
         final providerStr = respData['providerResponse'];
+        bool hasValidData = false;
 
         if (providerStr != null) {
           final providerResponse = json.decode(providerStr);
 
           if (providerResponse['data'] != null) {
             final data = providerResponse['data'];
+
+            final fullName = data['full_name']?.toString().trim() ?? '';
+            final aadhaarNum = data['aadhaar_number']?.toString().trim() ?? '';
+
+            if (fullName.isNotEmpty && aadhaarNum.isNotEmpty) {
+              hasValidData = true;
+            }
 
             if (data['full_name'] != null)
               _fullNameController.text = data['full_name'];
@@ -1067,46 +1374,60 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                   : aNum;
             }
 
-            if (data['profile_image'] != null) {
+            if (data['profile_image'] != null &&
+                data['profile_image'].toString().trim().isNotEmpty) {
               try {
-                _profileImageBytes = base64Decode(data['profile_image']);
+                String raw = data['profile_image'].toString().trim();
+                if (raw.contains(',')) {
+                  raw = raw.split(',').last;
+                }
+                final bytes = base64Decode(raw);
+                if (bytes.isNotEmpty) {
+                  _profileImageBytes = bytes;
+                }
               } catch (_) {}
             }
           }
         }
 
-        setState(() {
-          _isAadhaarVerified = true;
-          // Auto-fill OVD number for any slot that has Aadhaar Card selected
-          for (int i = 0; i < _ovdCount; i++) {
-            if (_ovdTypes[i] == "Aadhaar Card") {
-              _ovdNumberControllers[i].text = _aadhaarController.text;
+        if (hasValidData) {
+          setState(() {
+            _isAadhaarVerified = true;
+            // Auto-fill OVD number for any slot that has Aadhaar Card selected
+            for (int i = 0; i < _ovdCount; i++) {
+              if (_ovdTypes[i] == "Aadhaar Card") {
+                _ovdNumberControllers[i].text = _aadhaarController.text;
+              }
             }
-          }
-        });
+          });
 
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Aadhaar Verified. Data auto-filled successfully.'),
-
-            backgroundColor: Colors.green,
-          ),
-        );
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Aadhaar Verified. Data auto-filled successfully.'),
+              backgroundColor: Colors.green,
+            ),
+          );
+        } else {
+          handleFailure(
+            respData['message'] ??
+                'Verification Failed: Data missing. Please try again.',
+          );
+        }
       } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Verification Failed: ${response.body}'),
-
-            backgroundColor: Colors.red,
-          ),
-        );
+        String errorMsg =
+            'Verification Failed. Please check OTP and try again.';
+        try {
+          final errData = json.decode(response.body);
+          if (errData['message'] != null) {
+            errorMsg = errData['message'];
+          }
+        } catch (_) {}
+        handleFailure(errorMsg);
       }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red),
-      );
+      handleFailure('Network error or server unreachable. Please try again.');
     } finally {
-      setState(() => _isAadhaarLoading = false);
+      if (mounted) setState(() => _isAadhaarLoading = false);
     }
   }
 
@@ -1123,6 +1444,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
       return;
     }
 
+    if (!mounted) return;
     setState(() => _isMobileOtpLoading = true);
 
     try {
@@ -1135,7 +1457,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
       );
 
       if (response.statusCode == 200 || response.statusCode == 201) {
-        setState(() => _mobileOtpState = 1);
+        if (mounted) setState(() => _mobileOtpState = 1);
         _startMobileOtpTimer();
 
         ScaffoldMessenger.of(context).showSnackBar(
@@ -1159,7 +1481,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
         SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red),
       );
     } finally {
-      setState(() => _isMobileOtpLoading = false);
+      if (mounted) setState(() => _isMobileOtpLoading = false);
     }
   }
 
@@ -1172,6 +1494,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
       return;
     }
 
+    if (!mounted) return;
     setState(() => _isMobileOtpLoading = true);
 
     try {
@@ -1188,7 +1511,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
       );
 
       if (response.statusCode == 200 || response.statusCode == 201) {
-        setState(() => _mobileOtpState = 2);
+        if (mounted) setState(() => _mobileOtpState = 2);
 
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
@@ -1211,12 +1534,13 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
         SnackBar(content: Text('Error: $e'), backgroundColor: Colors.red),
       );
     } finally {
-      setState(() => _isMobileOtpLoading = false);
+      if (mounted) setState(() => _isMobileOtpLoading = false);
     }
   }
 
   @override
   void dispose() {
+    _aadhaarTimerObj?.cancel();
     _aadhaarController.dispose();
 
     _otpController.dispose();
@@ -1416,7 +1740,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
 
     _selectedGender = state['selectedGender'];
     _selectedMaritalStatus = state['selectedMaritalStatus'];
-    _selectedNationality = state['selectedNationality'];
+    _selectedNationality = state['selectedNationality'] ?? "Indian";
     _selectedResidentialStatus = state['selectedResidentialStatus'];
     _selectedCategory = state['selectedCategory'];
     _selectedPermanentAddressSame =
@@ -2088,89 +2412,164 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                 );
               },
 
-              child: _profileImageBytes != null
-                  ? ClipRRect(
-                      borderRadius: BorderRadius.circular(12),
-
-                      child: Image.memory(
-                        _profileImageBytes!,
-
-                        width: 100,
-
-                        height: 100,
-
-                        fit: BoxFit.cover,
+              child: _uploadingSlots.contains('PHOTO')
+                  ? Container(
+                      width: 100,
+                      height: 100,
+                      decoration: BoxDecoration(
+                        color: Colors.grey.shade100,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: Colors.grey.shade300,
+                          width: 1.5,
+                        ),
+                      ),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          SizedBox(
+                            width: 28,
+                            height: 28,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2.5,
+                              color: const Color(0xFF1A6B5A),
+                              backgroundColor: Colors.grey.shade300,
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            'Uploading…',
+                            style: TextStyle(
+                              fontSize: 9,
+                              color: Colors.grey.shade600,
+                            ),
+                          ),
+                        ],
                       ),
                     )
+                  : _profileImageBytes != null
+                  ? Stack(
+                      children: [
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(12),
+                          child: Image.memory(
+                            _profileImageBytes!,
+                            width: 100,
+                            height: 100,
+                            fit: BoxFit.cover,
+                            cacheWidth: 300,
+                          ),
+                        ),
+                        Positioned(
+                          top: 4,
+                          right: 4,
+                          child: GestureDetector(
+                            onTap: () {
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) => ImagePreviewScreen(
+                                    imageBytes: _profileImageBytes,
+                                  ),
+                                ),
+                              );
+                            },
+                            child: Container(
+                              padding: const EdgeInsets.all(4),
+                              decoration: const BoxDecoration(
+                                color: Colors.black54,
+                                shape: BoxShape.circle,
+                              ),
+                              child: const Icon(
+                                Icons.visibility,
+                                color: Colors.white,
+                                size: 12,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    )
                   : _photoBytes != null
-                  ? ClipRRect(
-                      borderRadius: BorderRadius.circular(12),
-                      // ✅ Use cached bytes instead of File path — safe after Android process death
-                      child: Image.memory(
-                        _photoBytes!,
-                        width: 100,
-                        height: 100,
-                        fit: BoxFit.cover,
-                      ),
+                  ? Stack(
+                      children: [
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(12),
+                          child: Image.memory(
+                            _photoBytes!,
+                            width: 100,
+                            height: 100,
+                            fit: BoxFit.cover,
+                            cacheWidth: 300,
+                          ),
+                        ),
+                        Positioned(
+                          top: 4,
+                          right: 4,
+                          child: GestureDetector(
+                            onTap: () {
+                              Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) => ImagePreviewScreen(
+                                    imageBytes: _photoBytes,
+                                  ),
+                                ),
+                              );
+                            },
+                            child: Container(
+                              padding: const EdgeInsets.all(4),
+                              decoration: const BoxDecoration(
+                                color: Colors.black54,
+                                shape: BoxShape.circle,
+                              ),
+                              child: const Icon(
+                                Icons.visibility,
+                                color: Colors.white,
+                                size: 12,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
                     )
                   : CustomPaint(
                       painter: DottedBorderPainter(
                         color: Colors.grey.shade400,
-
                         strokeWidth: 1.5,
-
                         gap: 6.0,
                       ),
-
                       child: Container(
                         height: 100,
-
                         width: 100,
-
                         alignment: Alignment.center,
-
                         decoration: BoxDecoration(
                           color: Colors.grey.shade100,
-
                           borderRadius: BorderRadius.circular(12),
-
                           border: Border.all(color: Colors.transparent),
                         ),
-
                         child: Column(
                           mainAxisAlignment: MainAxisAlignment.center,
-
                           children: [
                             Icon(
                               Icons.add_a_photo,
-
                               color: Colors.grey.shade400,
-
                               size: 24,
                             ),
-
                             const SizedBox(height: 4),
-
                             Text(
                               "Photo",
-
                               textAlign: TextAlign.center,
-
                               style: TextStyle(
                                 fontSize: 11,
-
                                 color: Colors.grey.shade600,
                               ),
                             ),
-
                             Text(
                               "Tap to add",
-
                               textAlign: TextAlign.center,
-
                               style: TextStyle(
                                 fontSize: 9,
-
                                 color: Colors.grey.shade400,
                               ),
                             ),
@@ -2300,7 +2699,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
         _buildCustomDropdown(
           "CATEGORY",
 
-          ["GEN", "SC", "ST", "OBC"],
+          ["GEN", "SC", "ST", "OBC", "NT"],
 
           _selectedCategory,
 
@@ -2368,6 +2767,8 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                             File(_signatureFile!.path),
 
                             fit: BoxFit.contain,
+                            cacheWidth:
+                                800, // Keeps the document preview memory extremely low
 
                             width: double.infinity,
 
@@ -2378,29 +2779,51 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
 
                       Positioned(
                         top: 8,
-
                         right: 8,
-
-                        child: GestureDetector(
-                          onTap: _showSignatureOptions,
-
-                          child: Container(
-                            padding: const EdgeInsets.all(6),
-
-                            decoration: const BoxDecoration(
-                              color: Colors.black54,
-
-                              shape: BoxShape.circle,
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            GestureDetector(
+                              onTap: () {
+                                Navigator.push(
+                                  context,
+                                  MaterialPageRoute(
+                                    builder: (_) => ImagePreviewScreen(
+                                      imageFile: _signatureFile,
+                                    ),
+                                  ),
+                                );
+                              },
+                              child: Container(
+                                padding: const EdgeInsets.all(6),
+                                decoration: const BoxDecoration(
+                                  color: Colors.black54,
+                                  shape: BoxShape.circle,
+                                ),
+                                child: const Icon(
+                                  Icons.visibility,
+                                  color: Colors.white,
+                                  size: 16,
+                                ),
+                              ),
                             ),
-
-                            child: const Icon(
-                              Icons.edit,
-
-                              color: Colors.white,
-
-                              size: 16,
+                            const SizedBox(width: 8),
+                            GestureDetector(
+                              onTap: _showSignatureOptions,
+                              child: Container(
+                                padding: const EdgeInsets.all(6),
+                                decoration: const BoxDecoration(
+                                  color: Colors.black54,
+                                  shape: BoxShape.circle,
+                                ),
+                                child: const Icon(
+                                  Icons.edit,
+                                  color: Colors.white,
+                                  size: 16,
+                                ),
+                              ),
                             ),
-                          ),
+                          ],
                         ),
                       ),
                     ],
@@ -2647,9 +3070,9 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
 
                 _currentAddressController,
 
-                readOnly:
-                    _isAadhaarVerified &&
-                    _currentAddressController.text.isNotEmpty,
+                // readOnly:
+                //     _isAadhaarVerified &&
+                //     _currentAddressController.text.isNotEmpty,
               ),
 
               const SizedBox(height: 16),
@@ -2666,9 +3089,11 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
 
                       isVerified: true,
 
-                      readOnly:
-                          _isAadhaarVerified &&
-                          _villageCityController.text.isNotEmpty,
+                      forceEditable: true,
+
+                      // readOnly:
+                      //     _isAadhaarVerified &&
+                      //     _villageCityController.text.isNotEmpty,
                     ),
                   ),
 
@@ -2682,9 +3107,9 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
 
                       isRequired: true,
 
-                      readOnly:
-                          _isAadhaarVerified &&
-                          _talukaController.text.isNotEmpty,
+                      // readOnly:
+                      //     _isAadhaarVerified &&
+                      //     _talukaController.text.isNotEmpty,
                     ),
                   ),
                 ],
@@ -2704,10 +3129,11 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
 
                       isVerified: true,
 
-                      readOnly:
-                          _isAadhaarVerified &&
-                          _districtController.text.isNotEmpty,
+                      forceEditable: true,
 
+                      // readOnly:
+                      //     _isAadhaarVerified &&
+                      //     _districtController.text.isNotEmpty,
                       inputFormatters: [
                         FilteringTextInputFormatter.allow(
                           RegExp(r'[a-zA-Z\s]'),
@@ -2730,9 +3156,11 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
 
                       isVerified: true,
 
-                      readOnly:
-                          _isAadhaarVerified &&
-                          _stateController.text.isNotEmpty,
+                      forceEditable: true,
+
+                      // readOnly:
+                      //     _isAadhaarVerified &&
+                      //     _stateController.text.isNotEmpty,
                     ),
                   ),
                 ],
@@ -2750,10 +3178,9 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
 
                       isRequired: true,
 
-                      readOnly:
-                          _isAadhaarVerified &&
-                          _pinCodeController.text.isNotEmpty,
-
+                      // readOnly:
+                      //     _isAadhaarVerified &&
+                      //     _pinCodeController.text.isNotEmpty,
                       keyboardType: TextInputType.number,
 
                       inputFormatters: [
@@ -2774,9 +3201,11 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
 
                       isVerified: true,
 
-                      readOnly:
-                          _isAadhaarVerified &&
-                          _countryController.text.isNotEmpty,
+                      forceEditable: true,
+
+                      // readOnly:
+                      //     _isAadhaarVerified &&
+                      //     _countryController.text.isNotEmpty,
                     ),
                   ),
                 ],
@@ -3110,7 +3539,13 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
 
                       isVerified: _isPanVerified,
 
-                      inputFormatters: [UpperCaseTextFormatter()],
+                      inputFormatters: [
+                        UpperCaseTextFormatter(),
+                        FilteringTextInputFormatter.allow(
+                          RegExp(r'[a-zA-Z0-9]'),
+                        ),
+                        LengthLimitingTextInputFormatter(10),
+                      ],
 
                       textCapitalization: TextCapitalization.characters,
 
@@ -3185,15 +3620,122 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                                       ),
                                     );
                                   } else {
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      const SnackBar(
-                                        content: Text(
-                                          'Name mismatch between PAN and Aadhaar.',
+                                    // Name mismatch — show dialog with both names
+                                    final bool?
+                                    proceed = await showDialog<bool>(
+                                      context: context,
+                                      barrierDismissible: false,
+                                      builder: (ctx) => AlertDialog(
+                                        shape: RoundedRectangleBorder(
+                                          borderRadius: BorderRadius.circular(
+                                            16,
+                                          ),
                                         ),
-
-                                        backgroundColor: Colors.red,
+                                        title: Row(
+                                          children: const [
+                                            Icon(
+                                              Icons.warning_amber_rounded,
+                                              color: Colors.orange,
+                                            ),
+                                            SizedBox(width: 8),
+                                            Text(
+                                              'Name Mismatch',
+                                              style: TextStyle(
+                                                fontWeight: FontWeight.bold,
+                                                color: Color(0xFF0F1E4A),
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                        content: Column(
+                                          mainAxisSize: MainAxisSize.min,
+                                          crossAxisAlignment:
+                                              CrossAxisAlignment.start,
+                                          children: [
+                                            const Text(
+                                              'The name on PAN does not match the Aadhaar name.',
+                                              style: TextStyle(
+                                                color: Colors.black54,
+                                                fontSize: 13,
+                                              ),
+                                            ),
+                                            const SizedBox(height: 16),
+                                            _nameMismatchRow(
+                                              label: 'Aadhaar Name',
+                                              name: _fullNameController.text,
+                                              color: const Color(0xFF1565C0),
+                                            ),
+                                            const SizedBox(height: 10),
+                                            _nameMismatchRow(
+                                              label: 'PAN Name',
+                                              name: result.fullName ?? '',
+                                              color: const Color(0xFFB71C1C),
+                                            ),
+                                            const SizedBox(height: 16),
+                                            const Text(
+                                              'Do you want to proceed anyway?',
+                                              style: TextStyle(
+                                                fontWeight: FontWeight.w600,
+                                                fontSize: 13,
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                        actions: [
+                                          TextButton(
+                                            onPressed: () =>
+                                                Navigator.pop(ctx, false),
+                                            child: const Text(
+                                              'Cancel',
+                                              style: TextStyle(
+                                                color: Colors.red,
+                                              ),
+                                            ),
+                                          ),
+                                          ElevatedButton(
+                                            style: ElevatedButton.styleFrom(
+                                              backgroundColor: const Color(
+                                                0xFF0F1E4A,
+                                              ),
+                                              shape: RoundedRectangleBorder(
+                                                borderRadius:
+                                                    BorderRadius.circular(8),
+                                              ),
+                                            ),
+                                            onPressed: () =>
+                                                Navigator.pop(ctx, true),
+                                            child: const Text(
+                                              'Proceed Anyway',
+                                              style: TextStyle(
+                                                color: Colors.white,
+                                              ),
+                                            ),
+                                          ),
+                                        ],
                                       ),
                                     );
+
+                                    if (proceed == true && mounted) {
+                                      setState(() {
+                                        _isPanVerified = true;
+                                        for (int i = 0; i < _ovdCount; i++) {
+                                          if (_ovdTypes[i] == "PAN Card") {
+                                            _ovdNumberControllers[i].text =
+                                                _panNumberController.text;
+                                          }
+                                        }
+                                      });
+                                      ScaffoldMessenger.of(
+                                        context,
+                                      ).showSnackBar(
+                                        const SnackBar(
+                                          content: Text(
+                                            'PAN accepted with name mismatch.',
+                                          ),
+                                          backgroundColor: Colors.orange,
+                                        ),
+                                      );
+                                    }
                                   }
                                 } else {
                                   ScaffoldMessenger.of(context).showSnackBar(
@@ -3307,7 +3849,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                       ),
 
                       child: Text(
-                        "Submitted",
+                        "Yes",
 
                         style: TextStyle(
                           color: _form60Status == "Submitted"
@@ -3374,13 +3916,34 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                   file: _form60File,
                   bottomSheetTitle: "Upload Form 60 / 61",
                   imageType: 'form60',
+                  uploadSlotKey: 'FORM60',
                   onPicked: (picked, locData) async {
+                    if (locData.isEmpty || locData["latitude"] == null) {
+                      _showErrorPopup(
+                        "Location not captured. Please enable location services and try again.",
+                      );
+                      return;
+                    }
+
                     // ✅ Read bytes NOW so temp-file cleanup won't lose them
                     final bytes = await File(picked.path).readAsBytes();
-                    setState(() {
-                      _form60File = picked;
-                      _form60Bytes = bytes;
-                    });
+
+                    final bool success = await _uploadImageInstantly(
+                      imageSlot: "FORM60",
+                      documentType: "Form 60/61",
+                      documentNumber: "",
+                      imageBytes: bytes,
+                      expiryDate: "",
+                      locationData: locData,
+                    );
+
+                    if (success && mounted) {
+                      setState(() {
+                        _form60File = picked;
+                      });
+                    } else if (mounted) {
+                      _showErrorPopup("Image upload failed. Please try again.");
+                    }
                   },
                 ),
               ],
@@ -3464,9 +4027,11 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
 
         // OVD Documents — Per-slot cards
         IgnorePointer(
-          ignoring: !_isPanVerified,
+          ignoring: !(_isPanVerified || _form60Status == "Submitted"),
           child: Opacity(
-            opacity: _isPanVerified ? 1.0 : 0.5,
+            opacity: (_isPanVerified || _form60Status == "Submitted")
+                ? 1.0
+                : 0.5,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -3596,6 +4161,12 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                                         break;
                                       }
                                     }
+
+                                    // Disable PAN Card if Form 60 is submitted
+                                    if (type == "PAN Card" &&
+                                        _form60Status == "Submitted") {
+                                      isUsedElsewhere = true;
+                                    }
                                     return DropdownMenuItem(
                                       value: type,
                                       enabled: !isUsedElsewhere,
@@ -3658,10 +4229,66 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                         Row(
                           children: [
                             Expanded(
-                              child: _buildCustomTextField(
-                                "OVD NUMBER",
-                                _ovdNumberControllers[slotIdx],
-                                hint: "Enter No.",
+                              child: Builder(
+                                builder: (context) {
+                                  final type = _ovdTypes[slotIdx];
+                                  List<TextInputFormatter> formatters = [];
+                                  if (type == 'Aadhaar Card') {
+                                    formatters = [
+                                      FilteringTextInputFormatter.digitsOnly,
+                                      LengthLimitingTextInputFormatter(12),
+                                    ];
+                                  } else if (type == 'PAN Card') {
+                                    formatters = [
+                                      FilteringTextInputFormatter.allow(
+                                        RegExp(r'[a-zA-Z0-9]'),
+                                      ),
+                                      LengthLimitingTextInputFormatter(10),
+                                    ];
+                                  } else if (type == 'Voter ID') {
+                                    formatters = [
+                                      FilteringTextInputFormatter.allow(
+                                        RegExp(r'[a-zA-Z0-9]'),
+                                      ),
+                                      LengthLimitingTextInputFormatter(10),
+                                    ];
+                                  } else if (type == 'Passport') {
+                                    formatters = [
+                                      FilteringTextInputFormatter.allow(
+                                        RegExp(r'[a-zA-Z0-9]'),
+                                      ),
+                                      LengthLimitingTextInputFormatter(15),
+                                    ];
+                                  } else if (type == 'Driving Licence') {
+                                    formatters = [
+                                      FilteringTextInputFormatter.allow(
+                                        RegExp(r'[a-zA-Z0-9]'),
+                                      ),
+                                      LengthLimitingTextInputFormatter(16),
+                                    ];
+                                  } else if (type == 'NREGA Job Card') {
+                                    formatters = [
+                                      FilteringTextInputFormatter.allow(
+                                        RegExp(r'[a-zA-Z0-9]'),
+                                      ),
+                                      LengthLimitingTextInputFormatter(20),
+                                    ];
+                                  } else {
+                                    formatters = [
+                                      FilteringTextInputFormatter.allow(
+                                        RegExp(r'[a-zA-Z0-9]'),
+                                      ),
+                                    ];
+                                  }
+                                  return _buildCustomTextField(
+                                    "OVD NUMBER",
+                                    _ovdNumberControllers[slotIdx],
+                                    hint: "Enter No.",
+                                    inputFormatters: formatters,
+                                    textCapitalization:
+                                        TextCapitalization.characters,
+                                  );
+                                },
                               ),
                             ),
                             const SizedBox(width: 16),
@@ -3754,14 +4381,42 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                               ? "Capture Aadhaar Front"
                               : "Upload OVD Document ${slotIdx + 1}",
                           imageType: 'ovd_$slotIdx',
+                          uploadSlotKey: 'OVD${slotIdx + 1}',
                           onPicked: (picked, locData) async {
-                            // ✅ Read bytes NOW so temp-file cleanup won't lose them
+                            if (locData.isEmpty ||
+                                locData["latitude"] == null) {
+                              _showErrorPopup(
+                                "Location not captured. Please enable location services and try again.",
+                              );
+                              return;
+                            }
+
                             final bytes = await File(picked.path).readAsBytes();
-                            setState(() {
-                              _ovdImageFiles[slotIdx] = picked;
-                              _ovdLocationData[slotIdx] = locData;
-                              _ovdImageBytesCache[slotIdx] = bytes;
-                            });
+
+                            final slotKey = 'OVD${slotIdx + 1}';
+                            setState(() => _uploadingSlots.add(slotKey));
+                            final bool success = await _uploadImageInstantly(
+                              imageSlot: slotKey,
+                              documentType: _ovdTypes[slotIdx] ?? "OVD",
+                              documentNumber:
+                                  _ovdNumberControllers[slotIdx].text,
+                              imageBytes: bytes,
+                              expiryDate: _ovdExpiryControllers[slotIdx].text,
+                              locationData: locData,
+                            );
+                            if (mounted)
+                              setState(() => _uploadingSlots.remove(slotKey));
+
+                            if (success && mounted) {
+                              setState(() {
+                                _ovdImageFiles[slotIdx] = picked;
+                                _ovdLocationData[slotIdx] = locData;
+                              });
+                            } else if (mounted) {
+                              _showErrorPopup(
+                                "Image upload failed. Please try again.",
+                              );
+                            }
                           },
                         ),
 
@@ -3773,15 +4428,42 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                             file: _aadhaarBackFile,
                             bottomSheetTitle: "Capture Aadhaar Back",
                             imageType: 'aadhaar_back',
+                            uploadSlotKey: 'OVD4',
                             onPicked: (picked, locData) async {
+                              if (locData.isEmpty ||
+                                  locData["latitude"] == null) {
+                                _showErrorPopup(
+                                  "Location not captured. Please enable location services and try again.",
+                                );
+                                return;
+                              }
+
                               final bytes = await File(
                                 picked.path,
                               ).readAsBytes();
-                              setState(() {
-                                _aadhaarBackFile = picked;
-                                _aadhaarBackBytesCache = bytes;
-                                _aadhaarBackLocationData = locData;
-                              });
+
+                              setState(() => _uploadingSlots.add('OVD4'));
+                              final bool success = await _uploadImageInstantly(
+                                imageSlot: "OVD4",
+                                documentType: "Aadhaar Back",
+                                documentNumber: _aadhaarController.text,
+                                imageBytes: bytes,
+                                expiryDate: "",
+                                locationData: locData,
+                              );
+                              if (mounted)
+                                setState(() => _uploadingSlots.remove('OVD4'));
+
+                              if (success && mounted) {
+                                setState(() {
+                                  _aadhaarBackFile = picked;
+                                  _aadhaarBackLocationData = locData;
+                                });
+                              } else if (mounted) {
+                                _showErrorPopup(
+                                  "Image upload failed. Please try again.",
+                                );
+                              }
                             },
                           ),
                         ],
@@ -4176,9 +4858,14 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                                     controller: _mobileOtpController,
 
                                     keyboardType: TextInputType.number,
+                                    maxLength: 6,
+                                    inputFormatters: [
+                                      FilteringTextInputFormatter.digitsOnly,
+                                    ],
 
                                     decoration: InputDecoration(
                                       hintText: "Enter OTP",
+                                      counterText: "",
 
                                       hintStyle: const TextStyle(fontSize: 12),
 
@@ -5994,9 +6681,14 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
 
       case 2: // KYC Documents
 
-        if (!_isPanVerified) {
+        final bool hasForm60 =
+            _form60Status == "Submitted" && _form60File != null;
+
+        if (!hasForm60 && !_isPanVerified) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Please verify PAN Number.')),
+            const SnackBar(
+              content: Text('Please verify PAN Number (or upload Form 60/61).'),
+            ),
           );
 
           return false;
@@ -6034,6 +6726,22 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
               ),
             );
             return false;
+          }
+          if (const [
+            'Passport',
+            'Driving Licence',
+            'NREGA Job Card',
+          ].contains(_ovdTypes[i])) {
+            if (_ovdExpiryControllers[i].text.trim().isEmpty) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text(
+                    'Please enter expiry date for ${_ovdTypes[i]} in OVD ${i + 1}.',
+                  ),
+                ),
+              );
+              return false;
+            }
           }
           if (_ovdImageFiles[i] == null) {
             ScaffoldMessenger.of(context).showSnackBar(
@@ -6086,6 +6794,22 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                 ),
               );
               return false;
+            }
+            if (const [
+              'Passport',
+              'Driving Licence',
+              'NREGA Job Card',
+            ].contains(_ovdTypes[2])) {
+              if (_ovdExpiryControllers[2].text.trim().isEmpty) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text(
+                      'Please enter expiry date for ${_ovdTypes[2]} in OVD 3.',
+                    ),
+                  ),
+                );
+                return false;
+              }
             }
             if (_ovdImageFiles[2] == null) {
               ScaffoldMessenger.of(context).showSnackBar(
@@ -6165,7 +6889,124 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
         return true;
 
       case 5: // Nominee Details
-        // Nominee fields have no mandatory validation requirement.
+        // ─── Rule 1: At least one nominee must exist ───────────────────
+        if (_nominees.isEmpty) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Please add at least one nominee.'),
+              backgroundColor: Colors.red,
+            ),
+          );
+          return false;
+        }
+
+        // ─── Rule 2: All added nominees must have required fields ───────
+        for (int i = 0; i < _nominees.length; i++) {
+          final n = _nominees[i];
+          final label = 'Nominee ${i + 1}';
+
+          if (n.fullNameController.text.trim().isEmpty) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('$label: Full name is required.'),
+                backgroundColor: Colors.red,
+              ),
+            );
+            return false;
+          }
+          if (n.relationshipController.text.trim().isEmpty) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('$label: Relationship is required.'),
+                backgroundColor: Colors.red,
+              ),
+            );
+            return false;
+          }
+          if (n.dobController.text.trim().isEmpty) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('$label: Date of birth is required.'),
+                backgroundColor: Colors.red,
+              ),
+            );
+            return false;
+          }
+          if (n.ageController.text.trim().isEmpty) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('$label: Age is required.'),
+                backgroundColor: Colors.red,
+              ),
+            );
+            return false;
+          }
+          if (n.shareController.text.trim().isEmpty) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text('$label: Share % is required.'),
+                backgroundColor: Colors.red,
+              ),
+            );
+            return false;
+          }
+        }
+
+        // ─── Rule 3: No nominee can have 0% share ──────────────────────
+        for (int i = 0; i < _nominees.length; i++) {
+          final int share =
+              int.tryParse(_nominees[i].shareController.text.trim()) ?? 0;
+          if (share == 0) {
+            final label = 'Nominee ${i + 1}';
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(
+                  '$label: Share cannot be 0%. Each nominee must have at least 1% share.',
+                ),
+                backgroundColor: Colors.red,
+              ),
+            );
+            return false;
+          }
+        }
+
+        // ─── Rule 4: If multiple nominees, one cannot hold 100% ─────────
+        if (_nominees.length > 1) {
+          for (int i = 0; i < _nominees.length; i++) {
+            final int share =
+                int.tryParse(_nominees[i].shareController.text.trim()) ?? 0;
+            if (share == 100) {
+              final label = 'Nominee ${i + 1}';
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text(
+                    '$label: Cannot have 100% share when multiple nominees are added. Please distribute the share.',
+                  ),
+                  backgroundColor: Colors.red,
+                ),
+              );
+              return false;
+            }
+          }
+        }
+
+        // ─── Rule 5: Total share must equal exactly 100 ─────────────────
+        final int totalShare = _nominees.fold(
+          0,
+          (sum, n) => sum + (int.tryParse(n.shareController.text.trim()) ?? 0),
+        );
+        if (totalShare != 100) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                'Total nominee share must be 100%. Current total: $totalShare%.',
+              ),
+              backgroundColor: Colors.red,
+            ),
+          );
+          return false;
+        }
+
         return true;
 
       default:
@@ -6559,7 +7400,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
   //                         "ovD4_Location": "",
   //                       };
 
-  //                       print('--- SENDING THIS SUBMIT PAYLOAD ---');
+  //                       print('--- SENDING THIS SUBMIT PAYLOAaaaD ---');
   //                       // WRAPPING IN "request" key for API model binding
   //                       final wrappedPayload = {"request": data};
   //                       print(json.encode(wrappedPayload));
@@ -6730,6 +7571,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                         curve: Curves.easeOut,
                       );
                     } else {
+                      if (!mounted) return;
                       setState(() => _isSubmitting = true);
 
                       try {
@@ -6806,6 +7648,22 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                             "encodeCached: no cached bytes, falling back to file",
                           );
                           return safeBase64(fileObj);
+                        }
+
+                        // ✅ If user did NOT upload their own photo, auto-upload
+                        // the Aadhaar-fetched profile photo via the instant-upload API.
+                        if (_photoFile == null && _profileImageBytes != null) {
+                          final autoLocData = await _getLocationData(context);
+                          if (autoLocData != null && mounted) {
+                            await _uploadImageInstantly(
+                              imageSlot: "PHOTO",
+                              documentType: "Profile Photo",
+                              documentNumber: "",
+                              imageBytes: _profileImageBytes!,
+                              expiryDate: "",
+                              locationData: autoLocData,
+                            );
+                          }
                         }
 
                         // ✅ Profile image — prefer cached bytes over file path
@@ -6921,13 +7779,16 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                           "residentialStatus": _selectedResidentialStatus ?? "",
                           "religion": _religionController.text,
                           "category": _selectedCategory ?? "",
-                          "photoBase64": pImgBase64,
-                          "signatureBase64": sBase64,
-                          "ovdImg1Base64": o1Base64,
-                          "ovdImg2Base64": o2Base64,
-                          "ovdImg3Base64": o3Base64,
-                          "ovdImg4Base64": aadhaarBackBase64,
-                          "form60_61_ImgBase64": f60Base64,
+                          "tempTransactionId": _isUpdateMode
+                              ? "0"
+                              : _tempTransactionId,
+                          "photoBase64": "",
+                          "signatureBase64": "",
+                          "ovdImg1Base64": "",
+                          "ovdImg2Base64": "",
+                          "ovdImg3Base64": "",
+                          "ovdImg4Base64": "",
+                          "form60_61_ImgBase64": "",
 
                           // Current address
                           "currentAddress": _currentAddressController.text,
@@ -6954,19 +7815,31 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                           "ovdType_1": _ovdTypes[0] ?? "",
                           "ovdNumber_1": _ovdNumberControllers[0].text,
                           "ovdExpiryDate_1":
-                              _ovdExpiryControllers[0].text.trim().isNotEmpty
-                              ? (convertExpiry(_ovdExpiryControllers[0].text) ??
-                                    currentIso)
-                              : currentIso,
+                              const [
+                                    'Passport',
+                                    'Driving Licence',
+                                    'NREGA Job Card',
+                                  ].contains(_ovdTypes[0]) &&
+                                  _ovdExpiryControllers[0].text
+                                      .trim()
+                                      .isNotEmpty
+                              ? convertExpiry(_ovdExpiryControllers[0].text)
+                              : null,
 
                           // OVD 2
                           "ovdType_2": _ovdTypes[1] ?? "",
                           "ovdNumber_2": _ovdNumberControllers[1].text,
                           "ovdExpiryDate_2":
-                              _ovdExpiryControllers[1].text.trim().isNotEmpty
-                              ? (convertExpiry(_ovdExpiryControllers[1].text) ??
-                                    currentIso)
-                              : currentIso,
+                              const [
+                                    'Passport',
+                                    'Driving Licence',
+                                    'NREGA Job Card',
+                                  ].contains(_ovdTypes[1]) &&
+                                  _ovdExpiryControllers[1].text
+                                      .trim()
+                                      .isNotEmpty
+                              ? convertExpiry(_ovdExpiryControllers[1].text)
+                              : null,
 
                           // OVD 3 — only if user added 3rd OVD
                           "ovdType_3": _ovdCount >= 3
@@ -6977,12 +7850,16 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                               : "",
                           "ovdExpiryDate_3":
                               (_ovdCount >= 3 &&
+                                  const [
+                                    'Passport',
+                                    'Driving Licence',
+                                    'NREGA Job Card',
+                                  ].contains(_ovdTypes[2]) &&
                                   _ovdExpiryControllers[2].text
                                       .trim()
                                       .isNotEmpty)
-                              ? (convertExpiry(_ovdExpiryControllers[2].text) ??
-                                    currentIso)
-                              : currentIso,
+                              ? convertExpiry(_ovdExpiryControllers[2].text)
+                              : null,
 
                           "addressProofType": _selectedAddressProof ?? "",
                           "addressProofNumber":
@@ -7143,7 +8020,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                             data,
                           );
 
-                          setState(() => _isSubmitting = false);
+                          if (mounted) setState(() => _isSubmitting = false);
 
                           if (response['success'] == true) {
                             final String msg =
@@ -7195,7 +8072,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                             data,
                           );
 
-                          setState(() => _isSubmitting = false);
+                          if (mounted) setState(() => _isSubmitting = false);
 
                           if (response != null) {
                             final String msg =
@@ -7243,7 +8120,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                           }
                         }
                       } catch (e, stack) {
-                        setState(() => _isSubmitting = false);
+                        if (mounted) setState(() => _isSubmitting = false);
                         debugPrint('Submit error: $e\n$stack');
                         if (context.mounted) {
                           ScaffoldMessenger.of(context).showSnackBar(
@@ -7347,6 +8224,10 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
         const SizedBox(height: 32),
 
         _buildFormNavigation(),
+
+        const SizedBox(height: 8),
+
+        Center(child: const VersionTrackerText(darkText: true)),
       ],
     );
   }
@@ -7396,6 +8277,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                 child: TextField(
                   controller: _aadhaarController,
                   keyboardType: TextInputType.number,
+                  inputFormatters: [FilteringTextInputFormatter.digitsOnly],
                   maxLength: 12,
                   readOnly: _isOtpSent,
                   onChanged: (_) => setState(() {}),
@@ -7473,6 +8355,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                   child: TextField(
                     controller: _otpController,
                     keyboardType: TextInputType.number,
+                    inputFormatters: [FilteringTextInputFormatter.digitsOnly],
                     maxLength: 6,
                     onChanged: (_) => setState(() {}),
                     decoration: InputDecoration(
@@ -7543,7 +8426,9 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                 width: double.infinity,
                 height: 52,
                 child: ElevatedButton(
-                  onPressed: _isAadhaarLoading
+                  onPressed:
+                      _isAadhaarLoading ||
+                          (_aadhaarResendTimer > 0 && !_isOtpSent)
                       ? null
                       : (_isOtpSent ? _verifyOtp : _sendOtp),
                   style: ElevatedButton.styleFrom(
@@ -7563,7 +8448,11 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                           ),
                         )
                       : Text(
-                          _isOtpSent ? "Verify OTP" : "Send OTP",
+                          _isOtpSent
+                              ? "Verify OTP"
+                              : (_aadhaarResendTimer > 0
+                                    ? "Resend OTP in ${_aadhaarResendTimer}s"
+                                    : "Send OTP"),
                           style: const TextStyle(
                             fontSize: 16,
                             fontWeight: FontWeight.bold,
@@ -7578,14 +8467,20 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
                 const SizedBox(height: 14),
                 Center(
                   child: TextButton(
-                    onPressed: () => setState(() {
-                      _isOtpSent = false;
-                      _otpController.clear();
-                    }),
-                    child: const Text(
-                      "Resend OTP",
+                    onPressed: _aadhaarResendTimer > 0
+                        ? null
+                        : () => setState(() {
+                            _isOtpSent = false;
+                            _otpController.clear();
+                          }),
+                    child: Text(
+                      _aadhaarResendTimer > 0
+                          ? "Resend OTP in ${_aadhaarResendTimer}s"
+                          : "Resend OTP",
                       style: TextStyle(
-                        color: AppColors.tealAccent,
+                        color: _aadhaarResendTimer > 0
+                            ? Colors.grey
+                            : AppColors.tealAccent,
                         fontWeight: FontWeight.w600,
                       ),
                     ),
@@ -7595,6 +8490,10 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
             ],
           ),
         ),
+
+        const SizedBox(height: 8),
+
+        Center(child: const VersionTrackerText(darkText: true)),
       ],
     );
   }
@@ -7852,7 +8751,7 @@ class _NewCustomerScreenState extends State<NewCustomerScreen> {
 
                       children: [
                         if (!_isAadhaarVerified) _buildAadhaarVerification(),
-                        // if (!_isAadhaarVerified) _buildKycDetails(),
+                        // if (!_isAadhaarVerified) _buildNomineeDetails(),
                         if (_isAadhaarVerified) _buildForm(),
                       ],
                     ),
